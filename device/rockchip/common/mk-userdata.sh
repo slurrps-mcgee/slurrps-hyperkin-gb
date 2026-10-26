@@ -1,10 +1,10 @@
 #!/bin/bash
 
-COMMON_DIR=$(cd `dirname $0`; pwd)
-if [ -h $0 ]
+COMMON_DIR=$(cd "$(dirname "$0")"; pwd)
+if [ -h "$0" ]
 then
-        CMD=$(readlink $0)
-        COMMON_DIR=$(dirname $CMD)
+        CMD=$(readlink "$0")
+        COMMON_DIR=$(dirname "$CMD")
 fi
 
 if [ -n "$1" ]
@@ -34,11 +34,25 @@ then
 
 elif [ $FS_TYPE = fat ]
 then
-	SIZE=$(du -h -BM --max-depth=1 $USERDATA_DIR | awk '{print int($1)}')
+	# Stage a copy without the git placeholder files
+	STAGE=$(mktemp -d)
+	cp -a "$USERDATA_DIR/." "$STAGE/"
+	find "$STAGE" \( -name .gitignore -o -name .gitkeep \) -delete
+
+	# FAT32 needs ~65525 clusters, so never go below 64M; leave room to grow.
+	# The partition is expanded to the whole card on first boot anyway.
+	SIZE=$(du -s -BM "$STAGE" | awk '{print int($1)}')
+	SIZE=$((SIZE + SIZE / 4 + 16))
+	[ $SIZE -lt 64 ] && SIZE=64
 	# echo "create image size=${SIZE}M"
-	dd if=/dev/zero of=$USERDATA_IMG bs=1M count=$SIZE >/dev/null 2>&1
-	mkfs.vfat $USERDATA_IMG >/dev/null 2>&1
-	mcopy -i $USERDATA_IMG $USERDATA_DIR/* ::/ >/dev/null 2>&1
+	rm -f "$USERDATA_IMG"
+	dd if=/dev/zero of="$USERDATA_IMG" bs=1M count=$SIZE >/dev/null 2>&1
+	if ! mkfs.vfat -F 32 -n RETRONSQ "$USERDATA_IMG" >/dev/null || \
+		! MTOOLS_SKIP_CHECK=1 mcopy -s -i "$USERDATA_IMG" "$STAGE"/* ::/; then
+		rm -rf "$STAGE"
+		exit 1
+	fi
+	rm -rf "$STAGE"
 else
         echo "file system: $FS_TYPE not support."
         exit 1

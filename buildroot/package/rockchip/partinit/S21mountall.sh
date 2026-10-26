@@ -30,55 +30,77 @@ resize_e2fs()
 	tune2fs $DEV -L $PART_NAME
 }
 
-resize_fatresize()
+fat_fs_size()
 {
+	# Filesystem size in bytes, read straight from the FAT boot sector
 	DEV=$1
-	SIZE=$2
-	MAX_SIZE=$3
 
-	fatresize -h >/dev/null 2>&1 || echo "No fatresize" && return
+	SIG=$(od -An -tx1 -j510 -N2 $DEV | tr -d ' \n')
+	[ "$SIG" == "55aa" ] || return
 
-	# Somehow fatresize only works for 256M+ fat
-	[ ! $SIZE -gt $((256 * 1024 * 1024)) ] && return
+	BPS=$(od -An -tu2 -j11 -N2 $DEV | tr -d ' \n')
+	TOTAL=$(od -An -tu2 -j19 -N2 $DEV | tr -d ' \n')
+	[ "$TOTAL" == "0" ] && TOTAL=$(od -An -tu4 -j32 -N4 $DEV | tr -d ' \n')
 
-	echo Resizing $DEV...
+	echo $(($BPS * $TOTAL))
+}
 
-	MIN_SIZE=$(($MAX_SIZE - 16 * 1024 * 1024))
-	[ $MIN_SIZE -lt $SIZE ] && MIN_SIZE=$SIZE
-	while [ $MAX_SIZE -gt $MIN_SIZE ];do
-		# Somehow fatresize cannot resize to max size
-		MAX_SIZE=$(($MAX_SIZE - 512 * 1024))
+expand_fat()
+{
+	# There is no reliable in-place FAT resizer, so back up the (small)
+	# freshly-flashed contents, reformat the whole partition and restore.
+	DEV=$1
+	LABEL=$2
+	TEMP=$(mktemp -d)
+	BACKUP=/tmp/fat-expand.tar
 
-		# Try to resize with fatresize, not always work
-		fatresize -s $MAX_SIZE $DEV && return
-	done
+	mount -t vfat $DEV $TEMP || { rmdir $TEMP; return; }
+
+	# Never touch a partition holding real user data (e.g. ROMs)
+	USED_KB=$(du -sk $TEMP | cut -f 1)
+	if [ $USED_KB -gt $((32 * 1024)) ];then
+		echo "$DEV holds ${USED_KB}K, not expanding it"
+		umount $TEMP; rmdir $TEMP
+		return
+	fi
+
+	echo Expanding $DEV...
+	if ! tar -cf $BACKUP -C $TEMP .;then
+		umount $TEMP; rmdir $TEMP; rm -f $BACKUP
+		return
+	fi
+	umount $TEMP
+
+	if mkfs.fat -F 32 -n $LABEL $DEV;then
+		mount -t vfat $DEV $TEMP && tar -xf $BACKUP -C $TEMP
+		sync
+		umount $TEMP
+	fi
+	rmdir $TEMP
+	rm -f $BACKUP
 }
 
 resize_fat()
 {
 	DEV=$1
 	MAX_SIZE=$4
-	FAT_INFO=$(fsck.fat -vy $DEV 2>/dev/null |grep -iE "data|files" |grep -o "[0-9]\+ ")
+	LABEL=RETRONSQ
 
-	[ $? -eq 0 ] || return
-
-	DATA_START=$(echo $FAT_INFO|cut -d ' ' -f 1)
-	DATA_SIZE=$(echo $FAT_INFO|cut -d ' ' -f 3)
-	SIZE=$(($DATA_START + $DATA_SIZE))
-	FILES=$(echo $FAT_INFO|cut -d ' ' -f 4)
-
-	# Avoid resizing when it's large enough (delta less than 4M)
-	[ $SIZE -gt $(($MAX_SIZE - 4 * 1024 * 1024)) ] && return
-
-	# Format it when it's empty
-	if [ $FILES -eq 0 ];then
-		echo Formatting $DEV...
-		mkfs.fat $DEV
+	SIZE=$(fat_fs_size $DEV)
+	if [ -z "$SIZE" ];then
+		# Only format a blank partition, never an unreadable one (the
+		# first 64K also covers the superblock of an old ext2 userdata)
+		if [ -z "$(head -c 65536 $DEV | tr -d '\000')" ];then
+			echo Formatting $DEV...
+			mkfs.fat -F 32 -n $LABEL $DEV
+		fi
 		return
 	fi
 
-	# Try fatresize (might not work though)
-	resize_fatresize $DEV $SIZE $MAX_SIZE
+	# Avoid resizing when it's large enough (delta less than 16M)
+	[ $SIZE -gt $(($MAX_SIZE - 16 * 1024 * 1024)) ] && return
+
+	expand_fat $DEV $LABEL
 }
 
 resize_ntfs()
@@ -140,6 +162,48 @@ do_resize()
 	esac
 
 	# Unsupported file system
+}
+
+grow_userdata_part()
+{
+	# The SD card image is only 128M. On first boot stretch userdata (the
+	# last partition) to the end of the card, before its filesystem is
+	# resized to match.
+	DEV=$(realpath /dev/block/by-name/userdata 2>/dev/null)
+	[ -b "$DEV" ] || return
+	PART_SYS=/sys/class/block/${DEV##*/}
+	PART=$(cat $PART_SYS/partition 2>/dev/null) || return
+	DISK_NAME=$(basename $(dirname $(readlink -f $PART_SYS)))
+	DISK=/dev/$DISK_NAME
+	DISK_SIZE=$(cat /sys/class/block/$DISK_NAME/size)
+	START=$(cat $PART_SYS/start)
+	END=$(($START + $(cat $PART_SYS/size)))
+
+	# Only the last partition can grow
+	for P in /sys/class/block/$DISK_NAME/$DISK_NAME*; do
+		[ -f $P/start ] || continue
+		[ $(cat $P/start) -gt $START ] && return
+	done
+
+	# Less than 16M (in 512 byte sectors) to gain: already done
+	[ $(($DISK_SIZE - $END)) -gt 32768 ] || return
+	which sgdisk >/dev/null || return
+
+	echo Growing $DEV to the end of $DISK...
+	INFO=$(sgdisk -i $PART $DISK) || return
+	TYPE=$(echo "$INFO" | sed -n 's/^Partition GUID code: \([0-9A-F-]*\).*/\1/p')
+	UUID=$(echo "$INFO" | sed -n 's/^Partition unique GUID: \([0-9A-F-]*\).*/\1/p')
+	NAME=$(echo "$INFO" | sed -n "s/^Partition name: '\(.*\)'/\1/p")
+	[ -n "$TYPE" ] && [ -n "$UUID" ] || return
+
+	# Move the backup GPT to the real end of the card, then recreate the
+	# partition with the same start (no realignment), type, GUID and name
+	sgdisk -e $DISK || return
+	sgdisk -a 1 -d $PART -n $PART:$START:0 -t $PART:$TYPE \
+		-u $PART:$UUID -c $PART:"$NAME" $DISK || return
+
+	# Tell the kernel; if that fails the new size shows up after a reboot
+	partx -u -n $PART $DISK || { sync; reboot -f; }
 }
 
 resizeall()
@@ -205,7 +269,8 @@ case "$1" in
 		mountall 2>&1 | tee $MOUNT_LOG
 		echo Log saved to $MOUNT_LOG
 	else
-		resizeall 2>&1 | tee $RESIZE_LOG
+		grow_userdata_part 2>&1 | tee $RESIZE_LOG
+		resizeall 2>&1 | tee -a $RESIZE_LOG
 		echo Log saved to $RESIZE_LOG
 		checkall 2>&1 | tee $CHECK_LOG
 		echo Log saved to $CHECK_LOG

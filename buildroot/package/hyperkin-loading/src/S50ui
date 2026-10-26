@@ -26,7 +26,7 @@ case "$1" in
       fi
 
 	/usr/bin/fbv -c -i -s 1 /etc/hyperkin-inc-vector-logo.png
-	$(RunGame)
+	StartLauncher
     else
       export LC_ALL='zh_CN.utf8'
 
@@ -38,7 +38,7 @@ case "$1" in
   stop)
     if [ $MINIGUI -eq 1 ]; then
       killall game
-	$(KillGame)
+	StopLauncher
     else
       killall weston
     fi

@@ -12,3 +12,7 @@
 /IMAGE/
 /rockdev/
 .*.swp
+
+# Container build logs and lock
+/build-full*.log
+/.build.lock

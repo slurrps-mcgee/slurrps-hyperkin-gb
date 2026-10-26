@@ -202,8 +202,14 @@ function lunch()
 	OLD_CONF=${TARGET_OUTPUT_DIR}/.config.old
 	CONF=${TARGET_OUTPUT_DIR}/.config
 	if diff ${OLD_CONF} ${CONF} 2>/dev/null|grep -qE "is not set$|=y$";then
-		read -p "Found old config, override it? (y/n):" YES
-		[ "$YES" != y ] && cp ${OLD_CONF} ${CONF}
+		# Without a terminal (containers, CI) the read below gets nothing and
+		# would silently throw the defconfig's changes away, so keep them
+		if [ -t 0 ]; then
+			read -p "Found old config, override it? (y/n):" YES
+			[ "$YES" != y ] && cp ${OLD_CONF} ${CONF}
+		else
+			echo "Found old config, using ${TARGET_BUILD_CONFIG}_defconfig"
+		fi
 	fi
 
 	if [ -z "$index" ]; then

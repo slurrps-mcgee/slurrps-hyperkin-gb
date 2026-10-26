@@ -1,0 +1,17 @@
+# Build environment for this 2018 Rockchip SDK (Buildroot 2018.02, kernel
+# 4.4). Modern distros' GCC/glibc/Python can't build its host tools, so use
+# the Ubuntu release the SDK was made for. See build-in-container.sh.
+FROM docker.io/library/ubuntu:18.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+	bc bison build-essential ca-certificates chrpath cmake cpio \
+	device-tree-compiler diffstat dosfstools e2fsprogs expect fakeroot file \
+	flex g++-multilib gawk gcc-multilib gdisk genext2fs git libncurses5-dev \
+	liblz4-tool libssl-dev locales mtools parted patchelf pkg-config python \
+	python3 rsync squashfs-tools texinfo time unzip wget zip \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& locale-gen en_US.UTF-8
+
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+WORKDIR /work

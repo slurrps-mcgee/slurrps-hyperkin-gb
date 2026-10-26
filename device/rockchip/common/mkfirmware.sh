@@ -35,7 +35,7 @@ then
 	if [ -f $ROOTFS_IMG ]
 	then
 		echo -n "create rootfs.img..."
-		ln -s -f $ROOTFS_IMG $ROCKDEV/rootfs.img
+		ln -s -f -r $ROOTFS_IMG $ROCKDEV/rootfs.img
 		echo "done."
 	else
 		echo "warning: $ROOTFS_IMG not found!"
@@ -45,7 +45,7 @@ fi
 if [ -f $PARAMETER ]
 then
 	echo -n "create parameter..."
-	ln -s -f $PARAMETER $ROCKDEV/parameter.txt
+	ln -s -f -r $PARAMETER $ROCKDEV/parameter.txt
 	echo "done."
 else
 	echo "warning: $PARAMETER not found!"
@@ -56,7 +56,7 @@ then
 	if [ -f $RECOVERY_IMG ]
 	then
 		echo -n "create recovery.img..."
-		ln -s -f $RECOVERY_IMG $ROCKDEV/recovery.img
+		ln -s -f -r $RECOVERY_IMG $ROCKDEV/recovery.img
 		echo "done."
 	else
 		echo "warning: $RECOVERY_IMG not found!"
@@ -68,7 +68,7 @@ then
 	if [ -f $MISC_IMG ]
 	then
 		echo -n "create misc.img..."
-		ln -s -f $MISC_IMG $ROCKDEV/misc.img
+		ln -s -f -r $MISC_IMG $ROCKDEV/misc.img
 		echo "done."
 	else
 		echo "warning: $MISC_IMG not found!"
@@ -102,7 +102,7 @@ fi
 if [ -f $UBOOT_IMG ]
 then
         echo -n "create uboot.img..."
-        ln -s -f $UBOOT_IMG $ROCKDEV/uboot.img
+        ln -s -f -r $UBOOT_IMG $ROCKDEV/uboot.img
         echo "done."
 else
         echo -e "\e[31m error: $UBOOT_IMG not found! \e[0m"
@@ -111,7 +111,7 @@ fi
 if [ -f $TRUST_IMG ]
 then
         echo -n "create trust.img..."
-        ln -s -f $TRUST_IMG $ROCKDEV/trust.img
+        ln -s -f -r $TRUST_IMG $ROCKDEV/trust.img
         echo "done."
 else
         echo -e "\e[31m error: $TRUST_IMG not found! \e[0m"
@@ -120,7 +120,7 @@ fi
 if [ -f $LOADER ]
 then
         echo -n "create loader..."
-        ln -s -f $LOADER $ROCKDEV/MiniLoaderAll.bin
+        ln -s -f -r $LOADER $ROCKDEV/MiniLoaderAll.bin
         echo "done."
 else
 	echo -e "\e[31m error: $LOADER not found,or there are multiple loaders! \e[0m"
@@ -130,7 +130,7 @@ fi
 #if [ -f $SPINOR_LOADER ]
 #then
 #        echo -n "create spinor loader..."
-#        ln -s -f $SPINOR_LOADER $ROCKDEV/MiniLoaderAll_SpiNor.bin
+#        ln -s -f -r $SPINOR_LOADER $ROCKDEV/MiniLoaderAll_SpiNor.bin
 #        echo "done."
 #else
 #	rm $SPINOR_LOADER_PATH 2>/dev/null
@@ -141,7 +141,7 @@ then
 	if [ -f $BOOT_IMG ]
 	then
 		echo -n "create boot.img..."
-		ln -s -f $BOOT_IMG $ROCKDEV/boot.img
+		ln -s -f -r $BOOT_IMG $ROCKDEV/boot.img
 		echo "done."
 	else
 		echo "warning: $BOOT_IMG not found!"
@@ -153,7 +153,7 @@ then
 	if [ -f $RAMBOOT_IMG ]
 	then
 	        echo -n "create boot.img..."
-	        ln -s -f $RAMBOOT_IMG $ROCKDEV/boot.img
+	        ln -s -f -r $RAMBOOT_IMG $ROCKDEV/boot.img
 	        echo "done."
 	else
 		echo "warning: $RAMBOOT_IMG not found!"

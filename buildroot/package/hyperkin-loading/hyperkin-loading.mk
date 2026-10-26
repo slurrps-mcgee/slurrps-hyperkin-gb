@@ -35,5 +35,21 @@ define HYPERKIN_LOADING_INSTALL_TARGET_CMDS
 	cp $(@D)/01_kill_retroarch $(TARGET_DIR)/etc/usbmount/umount.d/
 endef
 
+# Factory copy of the SD card's userdata files. sq-launcher puts back any of
+# them that went missing (deleted from a PC, card reformatted...). Done as
+# a finalize hook so every build picks up changes to device/rockchip/userdata.
+HYPERKIN_LOADING_USERDATA_DIR = $(TOPDIR)/../device/rockchip/userdata/$(if $(RK_USERDATA_DIR),$(RK_USERDATA_DIR),userdata_brk01)
+
+define HYPERKIN_LOADING_INSTALL_USERDATA_DEFAULTS
+	rm -rf $(TARGET_DIR)/usr/share/retronsq/userdata
+	mkdir -p $(TARGET_DIR)/usr/share/retronsq
+	cp -a $(HYPERKIN_LOADING_USERDATA_DIR) $(TARGET_DIR)/usr/share/retronsq/userdata
+	find $(TARGET_DIR)/usr/share/retronsq/userdata \
+		\( -name .gitignore -o -name .gitkeep \) -delete
+endef
+ifeq ($(BR2_PACKAGE_HYPERKIN_LOADING),y)
+TARGET_FINALIZE_HOOKS += HYPERKIN_LOADING_INSTALL_USERDATA_DEFAULTS
+endif
+
 $(eval $(autotools-package))
 

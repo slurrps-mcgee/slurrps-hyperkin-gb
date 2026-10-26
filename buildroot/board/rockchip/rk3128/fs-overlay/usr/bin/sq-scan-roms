@@ -1,0 +1,84 @@
+#!/bin/sh
+#
+# Build RetroArch playlists for the games on the SD card (userdata/roms) and
+# for every cartridge copied so far (userdata/rom), so they show up under
+# "Playlists" in the menu. Playlists are only rewritten when they change.
+#
+source /etc/check_dumper.sh
+
+PLAYLIST_DIR=/userdata/retroarch/playlists
+LIST=/tmp/sq-roms.list
+TMP=/tmp/sq-playlist.tmp
+TAB=$(printf '\t')
+
+mountpoint -q /userdata || exit 0
+mkdir -p $PLAYLIST_DIR
+
+# Display name RetroArch shows for a core, from its .info file
+CoreName(){
+	local base name
+	base=$(basename "$1" .so)
+	name=$(tr -d '\r' < "$USER_CORE_DIR/$base.info" 2>/dev/null | \
+		sed -n 's/^corename *= *"\(.*\)"/\1/p')
+	echo "${name:-${base%_libretro}}"
+}
+
+# Reads "path<TAB>label<TAB>core path" lines and writes playlist $1 in the
+# six-lines-per-entry format of RetroArch 1.7.4
+WritePlaylist(){
+	local out="$PLAYLIST_DIR/$1.lpl" last_core="" core_name=""
+	sort -f -t "$TAB" -k 2 | while IFS="$TAB" read -r path label core; do
+		if [ "$core" != "$last_core" ]; then
+			last_core=$core
+			core_name=$(CoreName "$core")
+		fi
+		printf '%s\n%s\n%s\n%s\nDETECT\n%s\n' \
+			"$path" "$label" "$core" "$core_name" "$1.lpl"
+	done > $TMP
+	if [ ! -s $TMP ]; then
+		rm -f "$out" $TMP
+		return
+	fi
+	cmp -s $TMP "$out" || cp $TMP "$out"
+	rm -f $TMP
+}
+
+# Every ROM on the SD card as "system<TAB>path<TAB>label". Zips are sorted
+# by the name of their folder (gb, gbc, gba). macOS "._" files are skipped.
+find $SD_ROM_PATH -type f 2> /dev/null | awk '
+	{
+		n = split($0, part, "/"); file = part[n]
+		if (substr(file, 1, 1) == ".") next
+		dot = match(file, /\.[^.]*$/)
+		if (!dot) next
+		ext = tolower(substr(file, dot + 1)); label = substr(file, 1, dot - 1)
+		sys = ""
+		if (ext == "gb") sys = "gb"
+		else if (ext == "gbc") sys = "gbc"
+		else if (ext == "gba" || ext == "agb") sys = "gba"
+		else if (ext == "zip") {
+			dir = tolower(part[n - 1])
+			if (dir ~ /gba|advance/) sys = "gba"
+			else if (dir ~ /gbc|color/) sys = "gbc"
+			else if (dir ~ /gb|boy/) sys = "gb"
+		}
+		if (sys != "") printf "%s\t%s\t%s\n", sys, $0, label
+	}' > $LIST
+
+for sys in gb gbc gba; do
+	case $sys in
+		gb)  name="Nintendo - Game Boy" ;;
+		gbc) name="Nintendo - Game Boy Color" ;;
+		gba) name="Nintendo - Game Boy Advance" ;;
+	esac
+	core=$(SystemCore $sys)
+	grep "^$sys$TAB" $LIST | cut -f 2,3 | sed "s|\$|$TAB$core|" | WritePlaylist "$name"
+done
+rm -f $LIST
+
+# Cartridges loaded before, playable without the cartridge inserted
+for rom in ${ROM_PATH}*.gb ${ROM_PATH}*.gbc ${ROM_PATH}*.gba; do
+	[ -f "$rom" ] || continue
+	file=${rom##*/}
+	printf '%s\t%s\t%s\n' "$rom" "${file%.*}" "$(CoreForRom "$file")"
+done | WritePlaylist "Cartridge Dumps"

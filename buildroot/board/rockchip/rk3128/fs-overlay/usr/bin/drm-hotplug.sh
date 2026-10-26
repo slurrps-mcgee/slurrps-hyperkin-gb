@@ -55,7 +55,7 @@ if [ `cat /sys/class/switch/h2w/state` == 2 ]; then
                 amixer cset name='Playback Path' 'OFF'
 		if [ -f /tmp/boot_complete ]; then
 #			echo "HDMI trigger start" > /dev/console
-			$(RunGame)
+			StartLauncher
 #			echo "HDMI trigger done" > /dev/console
 		fi
         else
@@ -66,7 +66,7 @@ else
 		amixer cset name='Playback Path' 'OFF'
 		if [ -f /tmp/boot_complete ]; then
 #			echo "HDMI trigger start" > /dev/console
-			$(RunGame)
+			StartLauncher
 #			echo "HDMI trigger done" > /dev/console
 		fi
 	else

@@ -1,0 +1,59 @@
+#!/bin/sh
+#
+# Keeps exactly one RetroArch running. An inserted cartridge always wins;
+# without one, the RetroArch menu lists the games on the SD card. Other
+# scripts (usbmount hooks, reset button) only stop RetroArch, and this loop
+# starts whatever should run next. Started by S50ui through StartLauncher.
+#
+source /etc/check_dumper.sh
+
+echo $$ > $LAUNCHER_PID
+SyncUserdata
+
+CART_FAILS=0
+QUICK_EXITS=0
+
+while true; do
+	if ! DisplayConnected; then
+		sleep 1
+		continue
+	fi
+
+	if CartPresent && [ ! -f $CART_FAILED ]; then
+		if ! PrepareCart; then
+			# Pulled mid-copy, or a cartridge the reader can't read. Don't
+			# loop on the loading screen forever: fall back to the menu
+			# until the cartridge is inserted again.
+			if CartPresent; then
+				CART_FAILS=$((CART_FAILS + 1))
+				if [ $CART_FAILS -ge 2 ]; then
+					Log "cartridge failed to load twice, showing the menu"
+					touch $CART_FAILED
+					CART_FAILS=0
+				fi
+			fi
+			sleep 1
+			continue
+		fi
+		CART_FAILS=0
+		START=$(date +%s)
+		LaunchCart
+	elif [ "$(CfgGet NO_CART menu)" = menu ]; then
+		CART_FAILS=0
+		START=$(date +%s)
+		LaunchMenu
+	else
+		CART_FAILS=0
+		rm -f $MODE_FILE
+		sleep 1
+		continue
+	fi
+
+	# Back off if RetroArch keeps dying straight away (bad core, no GPU...)
+	if [ $(($(date +%s) - START)) -lt 3 ]; then
+		QUICK_EXITS=$((QUICK_EXITS + 1))
+		[ $QUICK_EXITS -ge 3 ] && sleep 5
+	else
+		QUICK_EXITS=0
+	fi
+done

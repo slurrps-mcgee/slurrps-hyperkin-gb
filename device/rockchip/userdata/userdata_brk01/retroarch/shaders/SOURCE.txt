@@ -1,0 +1,10 @@
+These shaders are a small selection from libretro's glsl-shaders repository:
+  https://github.com/libretro/glsl-shaders
+  commit cba01a48b0974a1232bea68d999a7c21bc4c233e
+
+Each .glsl file keeps its original author and license header.
+
+Only light single-pass presets that compile on the RK3128's Mali-400 GPU
+(OpenGL ES 2.0, no highp in fragment shaders) are included. You can copy
+more .glslp/.glsl files into this folder from a PC; heavy multi-pass CRT
+shaders will be too slow for this GPU.

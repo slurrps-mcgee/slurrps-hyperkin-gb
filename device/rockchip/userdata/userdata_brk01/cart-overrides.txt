@@ -1,0 +1,12 @@
+# Pick the emulator core for one cartridge, one line per game:
+#
+#   <ROM file name>=<core>
+#
+# The ROM file name is the one that shows up in the "rom" folder after the
+# cartridge was played once. Cores: gpsp, mgba, vbam, or any core you copied
+# into retroarch/cores. Lines starting with # are ignored.
+#
+# Reproduction cartridges often use a different save chip than the original
+# game; if one doesn't save, try mgba:
+#
+#   Pokemon_Emerald.gba=mgba

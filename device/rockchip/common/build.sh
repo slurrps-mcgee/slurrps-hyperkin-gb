@@ -75,29 +75,33 @@ function build_sdcard(){
 		parted -s $SDCARD_IMG mkpart boot      12M 20M
 		parted -s $SDCARD_IMG mkpart rootfs    20M 60M
 		parted -s $SDCARD_IMG mkpart userdata    60M ${SDCARD_SIZE}M
-		partprobe
 		sgdisk --partition-guid=4:614e0000-0000-4b53-8000-1d28000054a9 $SDCARD_IMG
 
 		../u-boot/tools/mkimage -n rk3128 -T rksd -d $DDR_BIN ./idbloader-sdcard.img
 		cat $MINI_BIN >> ./idbloader-sdcard.img
 
-		LOOP=$(sudo losetup -f |sed 's/\/dev\///g')
-		echo ${LOOP}
-		if [[ "x${LOOP}" != "x" ]]; then
-			sudo kpartx -av $SDCARD_IMG
-			sleep 3
-			sudo dd conv=nocreat if=./idbloader-sdcard.img of=/dev/${LOOP} seek=64
-			sudo dd conv=nocreat if=./uboot.img of=/dev/mapper/${LOOP}p1
-			sudo dd conv=nocreat if=./trust.img of=/dev/mapper/${LOOP}p2
-			sudo dd conv=nocreat if=./boot.img of=/dev/mapper/${LOOP}p3
-			sudo dd conv=nocreat if=./rootfs.img of=/dev/mapper/${LOOP}p4
-			sudo dd conv=nocreat if=./userdata.img of=/dev/mapper/${LOOP}p5
-			sudo kpartx -d $SDCARD_IMG
+		# Write each image at its partition's offset straight into the file,
+		# so no root, loop devices or kpartx are needed
+		dd conv=notrunc if=./idbloader-sdcard.img of=$SDCARD_IMG seek=64
+		SDCARD_OK=1
+		PART=1
+		for IMG in uboot.img trust.img boot.img rootfs.img userdata.img; do
+			START=$(parted -s -m $SDCARD_IMG unit B print | grep "^$PART:" | cut -d: -f2 | tr -d B)
+			SIZE=$(parted -s -m $SDCARD_IMG unit B print | grep "^$PART:" | cut -d: -f4 | tr -d B)
+			if [ $(stat -L -c %s ./$IMG) -gt $SIZE ]; then
+				printf "\n $IMG doesn't fit in partition $PART ($SIZE bytes)\n"
+				SDCARD_OK=0
+				break
+			fi
+			dd conv=notrunc oflag=seek_bytes bs=1M if=./$IMG of=$SDCARD_IMG seek=$START
+			PART=$((PART + 1))
+		done
+		if [ $SDCARD_OK -eq 1 ]; then
 			zip -r $SDCARD_ZIP_IMG $SDCARD_IMG
 			printf "\nSDCard Image : [$SDCARD_IMG]\n"
 			printf "SDCard ZIP Image : [$SDCARD_ZIP_IMG]\n"
 		else
-			printf "\n No loop device can be used \n"
+			rm -f $SDCARD_IMG
 		fi
 		cd ../
 	else
