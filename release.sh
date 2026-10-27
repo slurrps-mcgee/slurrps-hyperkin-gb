@@ -56,7 +56,11 @@ $NEWER"
 	fail "uncommitted changes; commit (and build) first"
 git fetch -q origin
 [ -n "$(git branch -r --contains HEAD)" ] || fail "HEAD isn't pushed; git push first"
-REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+# Always the fork's origin: gh's own default can be the upstream (Hyperkin's
+# repo), which must never get these releases
+REPO=$(git remote get-url origin | sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##')
+echo "$REPO" | grep -Eq '^[^/]+/[^/]+$' || fail "origin isn't a GitHub repo: $(git remote get-url origin)"
+[ "$REPO" != hyperkin-game/hyperkin-gb ] || fail "origin is Hyperkin's repo; releases go to your fork"
 gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1 && fail "release $TAG already exists"
 
 DIST=$(mktemp -d)
