@@ -41,7 +41,8 @@ kernel/arch/arm/boot/dts/rk3128-brk01.dts            device tree, cmdline
 tests/                           tests (run-all.sh)
 docker/Containerfile             build and test environment
 build-in-container.sh            entry point for builds and tests
-.github/workflows/               tests on push; releases by hand
+.github/workflows/tests.yml      tests on every push
+release.sh                       publish a local build as a GitHub release
 VERSION                          the firmware version
 ```
 
@@ -104,7 +105,7 @@ source buildroot/build/envsetup.sh rockchip_rk3128_brk01 && make retronsq-rebuil
 That runs `tests/run-all.sh` in the container's `test` stage (the build
 image plus SDL2, Xvfb and Mesa). It takes a few minutes, needs no console
 and no firmware build, and runs on every push to GitHub
-(`.github/workflows/tests.yml`; releases run it before building). Run
+(`.github/workflows/tests.yml`). Run
 some groups only with:
 
 ```bash
@@ -321,10 +322,14 @@ result with `strings kernel/resource.img | grep console=` after a build.
 
 1. Set the version in `VERSION` (0.x versions are shown as "beta").
 2. Commit and push to `main`.
-3. GitHub → Actions → **Build firmware release** → Run workflow, with the
-   same version. It runs the tests, builds (2–3 hours), and publishes
+3. Build: `./build-in-container.sh` (and check the tests passed on GitHub,
+   or run `./build-in-container.sh test`).
+4. `./release.sh` (add `-n notes.md` for release notes). It checks the
+   images in `rockdev/` are for that version and newer than the firmware
+   sources, and that `HEAD` is pushed, then asks before publishing
    `RetronSQ-CFW-v<version>-sdcard.zip`, `...-update.img` and
-   `SHA256SUMS.txt` as release `v<version>`.
+   `SHA256SUMS.txt` as release `v<version>` (tagged at `HEAD`). Needs the
+   GitHub CLI, logged in (`gh auth login`).
 
 ## Debugging on the console
 

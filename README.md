@@ -410,8 +410,9 @@ The version is in the [`VERSION`](VERSION) file. It appears on the boot
 splash, the loading screen, the home screen, Cartridge Tools and the image
 names. While the major version is 0, "beta" is added automatically.
 
-To publish a release from GitHub: **Actions → Build firmware release → Run
-workflow**, and enter the version (e.g. `0.3.1`). It builds the firmware the
-same way (2–3 hours) and creates the release `v0.3.1` with the SD card zip,
-`update.img` and checksums. 0.x versions are marked as pre-releases. The
-build log and images are also kept as a workflow artifact for 14 days.
+To publish a release: commit and push, build with
+`./build-in-container.sh`, then run `./release.sh` (optionally
+`-n notes.md`). It checks the build in `rockdev/` matches `VERSION` and the
+committed sources, then creates the release `v<version>` with the SD card
+zip, `update.img` and checksums, after asking. 0.x versions are marked as
+pre-releases. It needs the GitHub CLI (`gh auth login`).
