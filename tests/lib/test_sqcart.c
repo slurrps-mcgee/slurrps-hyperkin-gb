@@ -98,7 +98,8 @@ static void test_scan_and_cache(void)
 	CHECK(sq_cache_valid(&c));		/* not read from the cartridge every time */
 	{
 		char* log = read_text("/userdata/logs/launcher.log");
-		CHECK(log && strstr(log, "the slot says deadbeef") && strstr(log, "read twice"));
+		CHECK(log && strstr(log, "the slot says deadbeef") &&
+			strstr(log, "read again in places: identical"));
 		free(log);
 	}
 
@@ -215,7 +216,7 @@ static void test_dump_to_library(void)
 		insert_cart("Golden.gba", 262144, 0, 11, 0, 4);
 		sq_cart_scan(&c);
 		sq_do_copy_to_library(&c, NULL, NULL, &added, &r);
-		CHECK(r.ok && added && strstr(r.line[3], "reading it twice"));
+		CHECK(r.ok && added && strstr(r.line[3], "reading it again"));
 	}
 }
 
@@ -403,6 +404,96 @@ static void test_rom_write(void)
 	sq_cart_scan(&c);
 	CHECK(sq_write_check(&c, &r) == 1 && !r.ok && strstr(r.line[0], "old game"));
 	free(game);
+}
+
+/* zlib's CRC-32, written here independently of crc.c */
+static uint32_t zlib_crc(const unsigned char* p, long n)
+{
+	uint32_t c = 0xFFFFFFFFu;
+	long i;
+	int k;
+	for (i = 0; i < n; i++) {
+		c ^= p[i];
+		for (k = 0; k < 8; k++)
+			c = (c & 1) ? (c >> 1) ^ 0xEDB88320u : c >> 1;
+	}
+	return ~c;
+}
+
+/* Flip the first byte of the cartridge's game (a read that differs) */
+static void flip_cart(void)
+{
+	char p[SQ_PATH_LEN];
+	FILE* fp;
+	int c;
+	path(p, "/media/cart/Flaky.gba");
+	fp = fopen(p, "r+b");
+	if (!fp)
+		return;
+	c = fgetc(fp);
+	fseek(fp, 0, SEEK_SET);
+	fputc(c ^ 0xFF, fp);
+	fclose(fp);
+}
+
+/* Which checksum the slot uses, and copies checked by reading again */
+static void test_verification(void)
+{
+	struct sq_cart c;
+	struct sq_error e;
+	int verified;
+	char p[SQ_PATH_LEN], name[64];
+
+	/* The slot's .crc is zlib's CRC-32, little endian: found, trusted */
+	clean();
+	insert_cart("Zlib.gba", 300000, 0, 40, 0, 1);
+	{
+		long size;
+		unsigned char* rom;
+		uint32_t z;
+		unsigned char b[4];
+		path(p, "/media/cart/Zlib.gba");
+		rom = sq_read_all(p, 1 << 20, &size);
+		z = zlib_crc(rom, size);
+		b[0] = z; b[1] = z >> 8; b[2] = z >> 16; b[3] = z >> 24;
+		put("/media/cart/Zlib.crc", b, 4);
+		CHECK(sq_crc_probe(p, (uint32_t)b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3], name,
+			sizeof(name)) == 1 && !strcmp(name, "crc32-zlib (little endian)"));
+		free(rom);
+	}
+	sq_cart_scan(&c);
+	CHECK(sq_cache_cartridge(&c, &verified, NULL, NULL, &e) == 0 && verified == SQ_VERIFIED_CRC);
+	{
+		char* v = read_text("/userdata/home/crc-variant");
+		CHECK(v && !strcmp(v, "crc32-zlib (little endian)"));	/* remembered */
+		free(v);
+	}
+	path(p, "/media/cart/Zlib.gba");
+	CHECK(sq_crc_probe(p, 0x12345678, name, sizeof(name)) == 0);	/* nothing matches */
+
+	/* A cartridge that reads differently the second time: the samples
+	 * catch it, it is read in full again, and the copy isn't trusted */
+	clean();
+	insert_cart("Flaky.gba", 262144, 0, 41, 0, 1);
+	sq_cart_scan(&c);
+	sq_test_after_copy = flip_cart;
+	CHECK(sq_cache_cartridge(&c, &verified, NULL, NULL, &e) == 0 && verified == SQ_UNVERIFIED);
+	sq_test_after_copy = NULL;
+	CHECK(!exists("/userdata/rom/Flaky.crc"));		/* read again next time */
+	{
+		char* log = read_text("/userdata/logs/launcher.log");
+		CHECK(log && strstr(log, "read again in places: DIFFERENT"));
+		free(log);
+	}
+	/* The samples alone, against an identical and a changed copy */
+	path(p, "/media/cart/Flaky.gba");
+	{
+		char q[SQ_PATH_LEN];
+		path(q, "/userdata/rom/Flaky.gba");
+		CHECK(sq_sample_check(p, q, c.rom_size) == 1);	/* the last read */
+		flip_cart();
+		CHECK(sq_sample_check(p, q, c.rom_size) == 0);
+	}
 }
 
 /* The copy of the cartridge's save, and old duplicate backups */
@@ -680,6 +771,7 @@ int main(void)
 	test_rom_write();
 	test_saves_and_delete();
 	test_cart_save_copy();
+	test_verification();
 	test_clock();
 	test_config();
 	test_library();

@@ -225,10 +225,10 @@ FsSize(){
 	echo $(( $(hexdump -s 32 -n 4 -e '1/4 "%u"' "$1") * 512 / 1048576 ))
 }
 
-# SameFiles: the image holds exactly the files MakeUserdata put in
+# SameFiles [IMAGE]: the image holds exactly the files MakeUserdata put in
 SameFiles(){
 	rm -rf "$G/out"; mkdir -p "$G/out"
-	mcopy -s -n -i "$G/userdata.img" "::*" "$G/out/" 2> /dev/null
+	mcopy -s -n -i "${1:-$G/userdata.img}" "::*" "$G/out/" 2> /dev/null
 	diff -r "$G/files" "$G/out" > /dev/null
 }
 
@@ -251,9 +251,65 @@ echo "not enough memory to keep the files"
 NewSandbox
 G="$SQ_ROOT"
 MakeUserdata 512
-LOW_MEMORY=1 RunExpand "$G/userdata.img"
+LOW_MEMORY=1
+RunExpand "$G/userdata.img"
+LOW_MEMORY=0
 Check "left as it is" Contains "$G/expand.log" "not enough memory"
 Check "files untouched" SameFiles
 Check "still 64M" Equal "$(FsSize "$G/userdata.img")" 64
+
+# --- At boot, through do_resize -----------------------------------------------
+#
+# What the console really runs: resizeall reads /etc/fstab and do_resize
+# finds the partition's size and name in sysfs. After the partition was
+# regrown at this boot its uevent has no PARTNAME; v0.3.3 passed that empty
+# name unquoted, the size shifted into its place, and the drive never grew.
+
+# RunResizeAll SIZE_GIB [NAMED]: the 64M userdata image (40 MB of files) as
+# /dev/mmcblk0p6 in a SIZE_GIB partition, found through
+# /dev/block/by-name/userdata and /etc/fstab, then do_resize. NAMED=1 puts
+# PARTNAME in its uevent.
+RunResizeAll(){
+	MakeUserdata 64
+	FatStubs
+	mkdir -p "$G/dev/block/by-name" "$G/sys/class/block/mmcblk0p6"
+	mv "$G/userdata.img" "$G/dev/mmcblk0p6"
+	truncate -s "$1G" "$G/dev/mmcblk0p6"
+	ln -sfn ../../mmcblk0p6 "$G/dev/block/by-name/userdata"
+	echo $(($1 * 1024 * 1024 * 2)) > "$G/sys/class/block/mmcblk0p6/size"
+	printf 'MAJOR=179\nMINOR=6\nDEVNAME=mmcblk0p6\nDEVTYPE=partition\n' > "$G/sys/class/block/mmcblk0p6/uevent"
+	[ "$2" = 1 ] && echo PARTNAME=userdata >> "$G/sys/class/block/mmcblk0p6/uevent"
+	echo "/dev/block/by-name/userdata	/userdata	vfat	defaults,noatime,flush	0	2" > "$G/fstab"
+	RunDoResize
+}
+
+RunDoResize(){
+	{
+		sed -n '/^le_uint()/,/^}/p; /^fat_fs_size()/,/^}/p; /^expand_fat()/,/^}/p;
+			/^resize_fat()/,/^}/p; /^do_resize()/,/^}/p' "$MOUNTALL" | sed \
+			-e "s|/dev/|$G/dev/|g" -e "s|/sys/|$G/sys/|g" -e 's|\[ -b |[ -e |'
+		echo "sed 's|/dev/|$G/dev/|' '$G/fstab' | while read LINE; do do_resize \$LINE; done"
+	} > "$G/resizeall.sh"
+	PATH="$G/fatbin:/sbin:/usr/sbin:$BASE_PATH" "$BUSYBOX" sh "$G/resizeall.sh" > "$G/expand.log" 2>&1
+}
+
+for GIB in 32 128; do
+	echo "first boot through do_resize: a $GIB GB card, no partition name in sysfs"
+	NewSandbox
+	G="$SQ_ROOT"
+	RunResizeAll $GIB
+	Check "the partition's size is found" Contains "$G/expand.log" "partition $(($GIB * 1024 * 1024 * 1024)) bytes"
+	Check "expanded" Contains "$G/expand.log" "expand: done"
+	Check "the filesystem fills the $GIB GB partition" eval '[ $(FsSize "$G/dev/mmcblk0p6") -ge $(($GIB * 1024 - 1)) ]'
+	Check "every file kept" SameFiles "$G/dev/mmcblk0p6"
+	RunDoResize
+	Check "next boot: already fills it (and says so)" Contains "$G/expand.log" "already fills its partition"
+done
+
+echo "through do_resize with the partition name in sysfs"
+NewSandbox
+G="$SQ_ROOT"
+RunResizeAll 1 1
+Check "expanded" Contains "$G/expand.log" "expand: done"
 
 Done

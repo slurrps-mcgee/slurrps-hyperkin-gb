@@ -103,6 +103,8 @@ LoadMedium Broken.gba 65536
 rm -rf "$R/fakedev/sda"
 CartEvent add
 Check "mount failure logged" Contains "$LOG_DIR/launcher.log" "couldn't mount /dev/sda"
+Check "and told to the home screen" Contains "$RUN_DIR/cart-error.txt" "The cartridge couldn't be read."
+Check "the slot showing up is logged" Contains "$LOG_DIR/launcher.log" "cartridge reader up"
 Check "state stays pending" Equal "$("$SQCART" reader-state)" pending
 
 echo "writing to the cartridge (Cartridge Tools)"

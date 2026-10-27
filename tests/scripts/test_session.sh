@@ -172,6 +172,7 @@ StartTestSession
 Check "the menu shows after two failed copies" WaitFor 10 RaLastHas "--menu"
 Check "failure logged" Contains "$LOG_DIR/launcher.log" "cartridge failed to load twice"
 Check "tried twice" Equal "$(Count sqload)" 2
+Check "the home screen is told why" Contains "$RUN_DIR/cart-error.txt" "Couldn't copy the cartridge."
 
 echo "NO_CART=none"
 NewSandbox

@@ -121,19 +121,6 @@ void sq_cart_write_record(const struct sq_cart* c, int game, int ok)
 
 #define CHUNK (64 * 1024)	/* writes and read-backs go in these steps */
 
-/* Open path for reading past the page cache: O_DIRECT, or where that isn't
- * supported, a plain open with the file's cached pages dropped */
-static int open_uncached(const char* path, int* direct)
-{
-	int fd = open(path, O_RDONLY | O_DIRECT);
-	*direct = fd >= 0;
-	if (fd < 0 && errno == EINVAL) {
-		fd = open(path, O_RDONLY);
-		if (fd >= 0)
-			posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-	}
-	return fd;
-}
 
 /*
  * Read size bytes of path back past the page cache, so what is compared is
@@ -146,7 +133,7 @@ static int read_back(const char* path, long size, const unsigned char* data, int
 {
 	unsigned char *buf = NULL, *want = NULL;
 	long off = 0;
-	int direct, fd = open_uncached(path, &direct), rc = -1;
+	int direct, fd = sq_open_uncached(path, &direct), rc = -1;
 
 	if (fd < 0) {
 		sq_fail(e, errno, "reading %s back", what);

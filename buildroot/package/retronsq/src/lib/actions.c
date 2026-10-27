@@ -120,7 +120,7 @@ void sq_do_copy_to_library(const struct sq_cart* c, sq_progress_fn progress,
 	*added = 1;
 	if (verified == SQ_VERIFIED_TWICE)
 		result(r, 1, "Copied to", line1, line2, save_copied
-			? "Checked by reading it twice; save copied too." : "Checked by reading it twice.");
+			? "Checked by reading it again; save copied too." : "Checked by reading it again.");
 	else if (verified)
 		result(r, 1, "Copied to", line1, line2, save_copied ? "Its save was copied too." : NULL);
 	else

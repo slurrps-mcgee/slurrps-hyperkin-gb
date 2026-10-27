@@ -357,11 +357,24 @@ the time every 5 minutes, and before a restart or power off from the home
 screen. Settings > *Date and time* sets it (`settimeofday`, then saves). The
 clock runs in UTC; a power-off loses the time it was off.
 
-**Reading cartridge...** The cartridge poll (twice a second) also looks at
-`sq_reader_state()`: while it is `pending` (the slot is on USB with a
-medium, not mounted yet) the header's top right says *Reading
+**Reading cartridge...** The slot connects to USB only once it has read
+the cartridge itself (it serves the `.crc` the moment it appears), so
+nothing can show earlier: there is no cartridge-detect line (the device
+tree's gpio-keys are the d-pad and reset). cart-event logs "cartridge
+reader up" (with or without the cartridge ready) when the slot appears.
+The cartridge poll (twice a second) looks at `sq_reader_state()`: while it
+is `pending` or `empty` (the slot is on USB, no cartridge mounted yet) the
+header's top right says *Reading
 cartridge...*, redrawn every 400 ms for its dots, then the cartridge's
 name once it is mounted.
+
+**When a cartridge can't be read** the home screen shows a message
+(`check_read_error` in the poller): the slot mounted a drive with no game
+on it (two polls in a row, once per `cart-generation`), the slot has been
+"reading" for 30 s, or a message file left by the scripts:
+`$RUN/cart-error.txt` (`CartError` in common.sh), written by `PrepareCart`
+when the copy fails (with sqload's reason) and by cart-event when the
+drive can't be mounted.
 
 **Saves page and options.** `sq_saves_scan` (`library.c`) lists the live
 saves (`.srm` in `roms/` and `rom/`) and the backups in `saves/`, by game.
@@ -578,12 +591,20 @@ flowchart LR
 - **Atomic result.** Data goes to `<name>.part`, which is fsynced and
   renamed only once complete. A cartridge pulled mid-copy leaves no
   truncated ROM.
-- **Verification and retry** (`sq_cache_cartridge`). If the CRC doesn't
-  match the reader's `.crc`, the cartridge is read again. If the second read
-  gives the same CRC as the first, the data is stable and the copy is
-  trusted (`SQ_VERIFIED_TWICE`): dirty contacts make reads differ, so a
-  mismatch that repeats exactly is the slot's checksum disagreeing (seen
-  with genuine cartridges), not a bad read. It gets a cached `.crc` like a
+- **Verification** (`sq_cache_cartridge`, `check_copy` in `cart.c`). If the
+  CRC doesn't match the reader's `.crc`: (1) `sq_crc_probe` (`crc.c`)
+  computes 16 CRC-32 variants of the SD copy in one pass and compares each
+  with the `.crc` in both byte orders; a match is trusted
+  (`SQ_VERIFIED_CRC`), logged ("checksum probe") and remembered in
+  `home/crc-variant`. Every genuine cartridge so far mismatched the stock
+  algorithm, so the logs will show which one the slot uses. (2) Otherwise
+  `sq_sample_check` reads 32 × 32 KB spread over the game straight from the
+  cartridge (`sq_open_uncached`: O_DIRECT, or the page cache dropped) and
+  compares them with the copy; identical is trusted (`SQ_VERIFIED_TWICE`).
+  Up to v0.3.3 the second, full read came out of Linux's page cache (4 s
+  instead of 60 s for 16 MB), so it compared the first read with itself.
+  (3) Samples that differ: the page cache is dropped (`sq_drop_cache`) and
+  the whole cartridge is read again; the same CRC twice is trusted. It gets a cached `.crc` like a
   matching copy, so it isn't read again on every insert. Only when the two
   reads differ is the ROM kept unverified (so the game runs), **without** a
   cached `.crc`, so the next insert reads the cartridge again. If the
@@ -800,13 +821,13 @@ browsed through *Start directory* use whatever core you pick there.
 
 The firmware version lives in the `VERSION` file at the top of the tree
 (`RETRONSQ_VERSION` in the environment overrides it; the release workflow
-sets it). While the major version is 0, " beta" is added: `0.3.3` is shown as
-**v0.3.3 beta**.
+sets it). While the major version is 0, " beta" is added: `0.3.4` is shown as
+**v0.3.4 beta**.
 
 A Buildroot finalize hook in `retronsq.mk` (`RETRONSQ_INSTALL_VERSION`)
 runs on every build:
 
-- writes `/etc/retronsq-version` ("Retron SQ CFW v0.3.3 beta"), printed at
+- writes `/etc/retronsq-version` ("Retron SQ CFW v0.3.4 beta"), printed at
   boot and shown by the home screen and Cartridge Tools;
 - fills `@VERSION_LABEL@` into the two SVG templates in
   `buildroot/package/retronsq/splash/` and renders them with `rsvg-convert`
@@ -856,15 +877,29 @@ every card. On first boot `S21mountall.sh` does:
    `/tmp`, only if they fit with 8 MiB to spare), formats the whole
    partition FAT32 and puts them back, logging how many files and folders
    came back. A completely blank partition is formatted. Anything else
-   unreadable is left alone. Up to v0.3.2 a filesystem holding more than
-   32 MiB was never expanded: a card with games copied on before its first
-   boot, or with a cartridge copy, stayed at 64 MiB.
+   unreadable is left alone. Every decision is logged ("fat: ..." and
+   "expand: ..." lines).
+
+   **Why every card stayed at 64 MiB up to v0.3.3:** `do_resize` passed
+   `$DEV $MOUNT_POINT $PART_NAME $MAX_SIZE` unquoted. Right after
+   `grow_userdata_part` regrows the partition (`partx`), its uevent has no
+   `PARTNAME`, so the empty name vanished, the size became the third
+   argument, `resize_fat`'s size was empty, and its "already big enough"
+   test returned silently (boot.log: "partition  bytes"). The arguments are
+   quoted now, the name falls back to `/dev/block/by-name/`, and
+   `resize_fat` reads the size from sysfs itself when it isn't passed. (Up
+   to v0.3.2 a filesystem holding more than 32 MiB was also never
+   expanded.)
 
 There is no reliable in-place FAT resizer, which is why it rebuilds. The
 `grow` tests run the real `expand_fat` (the console's BusyBox, the real
 `mkfs.fat`; mount and umount moved onto mtools) on a 64 MiB image holding
 40 MB of files, in 128 and 512 MiB partitions, and check every file comes
-back unchanged.
+back unchanged. They also run it the way the console does, through
+`/etc/fstab` and `do_resize`, with no `PARTNAME` in sysfs, on 32 GiB and
+128 GiB partitions. Cards of 32, 64 and 128 GB get FAT32 with 32 KB
+clusters (`mkfs.fat`'s choice); `fsck.fat` at every boot reads the whole
+FAT, so on big cards the "check" time in boot.log grows a little.
 
 Rockchip's `61-sd-cards-auto-mount.rules` (mount any FAT partition of an
 SD card at `/mnt/sdcard`) is not installed: the console's only SD card is

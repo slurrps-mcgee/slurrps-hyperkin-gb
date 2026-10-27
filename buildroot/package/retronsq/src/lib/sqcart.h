@@ -128,6 +128,10 @@ uint32_t sq_crc_update(uint32_t crc, const uint8_t* data, size_t len);
 uint32_t sq_crc_buffer(uint32_t crc, const uint8_t* data, size_t len);
 /* Read a 4-byte big-endian .crc file; 0 on success */
 int sq_crc_read_file(const char* path, uint32_t* crc);
+/* Which CRC-32 variant of the file at path gives expected (the slot's
+ * .crc): 1 and its name when one does, 0 when none, -1 on a read error.
+ * See crc.c. */
+int sq_crc_probe(const char* path, uint32_t expected, char* name, size_t len);
 
 /* --- the reader --------------------------------------------------------- */
 
@@ -179,6 +183,17 @@ int sq_cache_valid(const struct sq_cart* c);
  */
 int sq_copy(const char* src, const char* dst, uint32_t* crc,
 	sq_progress_fn progress, void* ctx, struct sq_error* e);
+/* Open a file for reading past the page cache (O_DIRECT, or where that
+ * isn't supported a plain open with its cached pages dropped): reading the
+ * cartridge again must really read the cartridge. *direct says which. */
+int sq_open_uncached(const char* path, int* direct);
+/* Drop a file's pages from the page cache, so the next read is real */
+void sq_drop_cache(const char* path);
+/* Read 32 samples of 32 KB spread over the cartridge's game (cart, past the
+ * cache) and compare them with the copy: 1 identical, 0 different, -1 on a
+ * read error */
+int sq_sample_check(const char* cart, const char* copy, long size);
+
 /* The reader's CRC of a file, without copying it */
 int sq_file_crc(const char* path, uint32_t* crc, sq_progress_fn progress,
 	void* ctx, struct sq_error* e);
@@ -186,14 +201,20 @@ int sq_file_crc(const char* path, uint32_t* crc, sq_progress_fn progress,
 /*
  * How far a copy of the cartridge can be trusted (*verified below):
  *   SQ_VERIFIED_CRC    its checksum matches the one the slot gives (.crc)
- *   SQ_VERIFIED_TWICE  it doesn't, but two reads gave identical data. Dirty
- *                      contacts make reads differ; a mismatch that repeats
- *                      exactly is the slot's checksum disagreeing (it does
- *                      for some genuine cartridges), not a bad read.
+ *                      (or one of the CRC-32 variants sq_crc_probe tries)
+ *   SQ_VERIFIED_TWICE  it doesn't, but reading the cartridge again (past
+ *                      the page cache: 32 samples, or all of it) gave
+ *                      identical data. Dirty contacts make reads differ; a
+ *                      mismatch that repeats exactly is the slot's checksum
+ *                      disagreeing (it does for genuine cartridges), not a
+ *                      bad read.
  *   SQ_UNVERIFIED      neither (kept so the game runs, read again next time)
  * Mismatches are logged to launcher.log with both checksums.
  */
 enum { SQ_UNVERIFIED, SQ_VERIFIED_CRC, SQ_VERIFIED_TWICE };
+/* Tests only: called between a copy and reading samples again (to
+ * imitate a cartridge that reads differently each time) */
+extern void (*sq_test_after_copy)(void);
 
 /*
  * Copy the cartridge's ROM into the cache, checked against its .crc. A

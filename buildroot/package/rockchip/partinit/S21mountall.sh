@@ -129,6 +129,18 @@ resize_fat()
 	DEV=$1
 	MAX_SIZE=$4
 	LABEL=RETRONSQ
+	# The partition's size, from sysfs if it wasn't passed (v0.3.3 and
+	# older lost it: an empty partition name shifted the arguments, and the
+	# drive never grew)
+	case "$MAX_SIZE" in
+		''|*[!0-9]*)
+			MAX_SIZE=$(( $(cat /sys/class/block/$(basename $(realpath $DEV))/size 2>/dev/null || echo 0) * 512 ))
+			;;
+	esac
+	if [ "$MAX_SIZE" -le 0 ];then
+		echo "fat: can't read the size of $DEV's partition, not resizing"
+		return
+	fi
 	# The image's filesystem is 64M. One up to this size can be rebuilt to
 	# fill its partition; a bigger FAT was made by the user (on a PC) and is
 	# never reformatted.
@@ -147,13 +159,17 @@ resize_fat()
 	fi
 
 	# Avoid resizing when it's large enough (delta less than 16M)
-	[ $SIZE -gt $(($MAX_SIZE - 16 * 1024 * 1024)) ] && return
+	if [ $SIZE -gt $(($MAX_SIZE - 16 * 1024 * 1024)) ];then
+		echo "fat: $DEV already fills its partition"
+		return
+	fi
 	if [ $SIZE -gt $REBUILD_MAX ];then
 		echo "fat: $DEV is bigger than the image's filesystem, not rebuilding it"
 		return
 	fi
 
-	expand_fat $DEV $LABEL
+	echo "fat: expanding $DEV to $(($MAX_SIZE / 1048576)) MiB"
+	expand_fat "$DEV" "$LABEL"
 }
 
 # Grow an NTFS filesystem to its partition (stock, unused here)
@@ -196,22 +212,30 @@ do_resize()
 	# Unknown device
 	[ -b "$DEV" ] || return
 
+	LINK=$DEV
 	DEV=$(realpath $DEV)
 	SYS_PATH=/sys/class/block/${DEV##*/}
 	MAX_SIZE=$(( $(cat ${SYS_PATH}/size) * 512))
 	PART_NAME=$(grep PARTNAME ${SYS_PATH}/uevent | cut -d '=' -f 2)
+	# A partition regrown at this boot has no name in uevent any more: take
+	# it from /dev/block/by-name/<name>
+	case "$LINK" in
+		*/by-name/*) [ -n "$PART_NAME" ] || PART_NAME=${LINK##*/} ;;
+	esac
 
+	# Quoted: an empty value must not shift the others (v0.3.3's drive
+	# stayed at 64M because of that)
 	case $FSTYPE in
 		ext*)
-			resize_e2fs $DEV $MOUNT_POINT $PART_NAME $MAX_SIZE
+			resize_e2fs "$DEV" "$MOUNT_POINT" "$PART_NAME" "$MAX_SIZE"
 			return
 			;;
 		vfat)
-			resize_fat $DEV $MOUNT_POINT $PART_NAME $MAX_SIZE
+			resize_fat "$DEV" "$MOUNT_POINT" "$PART_NAME" "$MAX_SIZE"
 			return
 			;;
 		ntfs)
-			resize_ntfs $DEV $MOUNT_POINT $PART_NAME $MAX_SIZE
+			resize_ntfs "$DEV" "$MOUNT_POINT" "$PART_NAME" "$MAX_SIZE"
 			return
 			;;
 	esac

@@ -63,6 +63,7 @@ CART_PLAYED="$RUN_DIR/cart-played"            # this insert already auto-started
 HOME_REQUEST="$RUN_DIR/home-request"          # what sqhome asked for (see RunHomeRequest)
 REPLAY_FLAG="$RUN_DIR/replay"                 # reset button: start the same game again
 WRITE_CHECK="$RUN_DIR/write-check.txt"        # verdict on a save written to the cartridge
+CART_ERROR="$RUN_DIR/cart-error.txt"          # a cartridge that couldn't be read (CartError)
 RA_LOG="$RUN_DIR/retroarch.log"               # RetroArch's log for the current run
 HOME="$R/userdata"                            # RetroArch expands "~" in its config to this
 
@@ -366,6 +367,11 @@ PrepareCart(){
 		done < "$RUN_DIR/sqload.log"
 		if [ $rc != 0 ]; then
 			LogSD "copying $name failed (sqload exit status $rc)"
+			# The reason, for the home screen: sqload's "copy failed after
+			# N s: <what>" line
+			CartError "Couldn't copy the cartridge." \
+				"$(sed -n 's/^.*copy failed after [0-9.]* s: //p' "$RUN_DIR/sqload.log" | tail -n 1 | cut -c 1-50)" \
+				"Take it out, clean its contacts and" "insert it again."
 			return 1
 		fi
 	fi
@@ -633,6 +639,20 @@ StopSession(){
 }
 
 # --- Event handlers ----------------------------------------------------------
+
+# CartError LINE...: tell the home screen a cartridge couldn't be read (it
+# shows $CART_ERROR as a message when it next looks, then deletes it).
+# Lines of at most 50 characters; the first is the headline.
+CartError(){
+	local line
+	{
+		echo "OK=0"
+		for line in "$@"; do
+			echo "$line"
+		done
+	} > "$CART_ERROR.tmp" && mv "$CART_ERROR.tmp" "$CART_ERROR"
+	LogSD "cartridge error shown: $1 $2"
+}
 
 # cart-event, cartridge inserted. With CART_AUTOLOAD=1 (default) stop
 # whatever runs (even a game from the SD card); sq-session then loads the

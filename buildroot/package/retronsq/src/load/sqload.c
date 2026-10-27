@@ -95,9 +95,10 @@ static void* copy_thread(void* arg)
 	sq_log("copying %s, %ld bytes", cart.rom, cart.rom_size);
 	copy_ok = sq_cache_cartridge(&cart, &verified, progress, NULL, &e) == 0;
 	if (copy_ok)
-		sq_log("copied in %.1f s, %s", (ms_now() - start) / 1000.0,
+		sq_log("copied in %.1f s (%.2f MB/s), %s", (ms_now() - start) / 1000.0,
+			cart.rom_size / 1048576.0 / ((ms_now() - start + 1) / 1000.0),
 			verified == SQ_VERIFIED_CRC ? "checksum verified"
-			: verified == SQ_VERIFIED_TWICE ? "read twice identically (the slot's checksum differs)"
+			: verified == SQ_VERIFIED_TWICE ? "checked by re-reading it (the slot's checksum differs)"
 			: "checksum NOT verified (copied anyway)");
 	else
 		sq_log("copy failed after %.1f s: %s", (ms_now() - start) / 1000.0, e.msg);

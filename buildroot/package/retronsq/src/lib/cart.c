@@ -315,6 +315,40 @@ static void log_mismatch(const struct sq_cart* c, uint32_t crc, uint32_t expecte
 		c->rom, c->title, c->rom_size, attempt, (unsigned)crc, (unsigned)expected);
 }
 
+void (*sq_test_after_copy)(void);
+
+/*
+ * A copy of the cartridge (src -> dst, its CRC crc) didn't match the slot's
+ * checksum: is the copy still good? First, which checksum the slot uses
+ * (sq_crc_probe, on the SD copy: no cartridge reads); then samples of the
+ * cartridge read again past the cache (sq_sample_check, about 1 MB).
+ * SQ_VERIFIED_CRC, SQ_VERIFIED_TWICE or SQ_UNVERIFIED (the caller then
+ * reads it all again).
+ */
+static int check_copy(const struct sq_cart* c, const char* src, const char* dst,
+	uint32_t crc, uint32_t expected)
+{
+	char variant[64], path[SQ_PATH_LEN];
+	int same;
+
+	log_mismatch(c, crc, expected, 1);
+	if (sq_crc_probe(dst, expected, variant, sizeof(variant)) == 1) {
+		sq_log_sd("cartridge: checksum probe: the slot's checksum is %s; the copy matches it",
+			variant);
+		sq_mkdirs(sq_path(path, sizeof(path), SQ_HOME_DIR));
+		sq_write_atomic(sq_path(path, sizeof(path), SQ_HOME_DIR "/crc-variant"), variant,
+			(long)strlen(variant), NULL);
+		return SQ_VERIFIED_CRC;
+	}
+	sq_log_sd("cartridge: checksum probe: no known checksum matches the slot's");
+	if (sq_test_after_copy)
+		sq_test_after_copy();
+	same = sq_sample_check(src, dst, c->rom_size);
+	sq_log_sd("cartridge: %s read again in places: %s", c->rom,
+		same == 1 ? "identical, keeping the copy" : same == 0 ? "DIFFERENT" : "read error");
+	return same == 1 ? SQ_VERIFIED_TWICE : SQ_UNVERIFIED;
+}
+
 int sq_cache_cartridge(const struct sq_cart* c, int* verified,
 	sq_progress_fn progress, void* ctx, struct sq_error* e)
 {
@@ -349,18 +383,22 @@ int sq_cache_cartridge(const struct sq_cart* c, int* verified,
 		}
 		if (crc == expected)
 			*verified = SQ_VERIFIED_CRC;
-		else if (copied && crc == first)
-			*verified = SQ_VERIFIED_TWICE;	/* see sqcart.h */
+		else if (!copied)
+			*verified = check_copy(c, src, dst, crc, expected);
+		else if (crc == first)
+			*verified = SQ_VERIFIED_TWICE;	/* read twice, really (see below) */
 		else
 			log_mismatch(c, crc, expected, attempt + 1);
 		if (!copied)
 			first = crc;
 		copied = 1;
+		/* Read it all again only from the cartridge, not from what Linux
+		 * still holds of the first read */
+		if (!*verified)
+			sq_drop_cache(src);
 	}
 	if (!copied)
 		return -1;
-	if (*verified == SQ_VERIFIED_TWICE)
-		sq_log_sd("cartridge: %s read twice with identical data; keeping it", c->rom);
 	/* Without a matching CRC only the cartridge still being there vouches
 	 * for the data: a copy that "worked" while it was pulled is dropped */
 	if (!*verified && !sq_cart_still_there(c)) {
@@ -448,14 +486,18 @@ int sq_dump_to_library(const struct sq_cart* c, char* out, size_t len,
 		}
 		if (!have_crc || crc == expected)
 			*verified = SQ_VERIFIED_CRC;
-		else if (from_cache || (attempt > 0 && crc == first))
-			*verified = SQ_VERIFIED_TWICE;	/* the trusted copy, or read twice */
+		else if (from_cache)
+			*verified = SQ_VERIFIED_TWICE;	/* the trusted copy */
+		else if (attempt == 0)
+			*verified = check_copy(c, src, out, crc, expected);
+		else if (crc == first)
+			*verified = SQ_VERIFIED_TWICE;	/* read twice, really */
 		else
 			log_mismatch(c, crc, expected, attempt + 1);
 		first = crc;
+		if (!*verified)
+			sq_drop_cache(src);
 	}
-	if (*verified == SQ_VERIFIED_TWICE && !from_cache)
-		sq_log_sd("cartridge: %s read twice with identical data; keeping it", c->rom);
 	/* As in sq_cache_cartridge: unverified data from a cartridge that is
 	 * gone now isn't kept */
 	if ((!have_crc || !*verified) && !sq_cart_still_there(c)) {

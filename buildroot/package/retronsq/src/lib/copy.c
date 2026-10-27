@@ -11,6 +11,7 @@
  * flushed, so an interrupted copy never leaves a truncated file behind
  * under the real name.
  */
+#define _GNU_SOURCE	/* O_DIRECT */
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -254,4 +255,71 @@ int sq_file_crc(const char* path, uint32_t* crc, sq_progress_fn progress,
 		return -1;
 	*crc = sum;
 	return 0;
+}
+
+/* --- reading the cartridge again, for real --------------------------------- */
+
+int sq_open_uncached(const char* path, int* direct)
+{
+	int fd = open(path, O_RDONLY | O_DIRECT);
+	*direct = fd >= 0;
+	if (fd < 0 && errno == EINVAL) {
+		fd = open(path, O_RDONLY);
+		if (fd >= 0)
+			posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+	}
+	return fd;
+}
+
+void sq_drop_cache(const char* path)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd >= 0) {
+		posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+		close(fd);
+	}
+}
+
+#define SAMPLES 32
+#define SAMPLE_SIZE (32 * 1024)
+
+int sq_sample_check(const char* cart, const char* copy, long size)
+{
+	unsigned char *a = NULL, *b = (unsigned char*)malloc(SAMPLE_SIZE);
+	int direct, i, same = 1, fd = sq_open_uncached(cart, &direct), cfd = open(copy, O_RDONLY);
+
+	if (fd < 0 || cfd < 0 || !b || posix_memalign((void**)&a, 4096, SAMPLE_SIZE) != 0) {
+		same = -1;
+		goto out;
+	}
+	for (i = 0; i < SAMPLES && same == 1; i++) {
+		/* Spread over the whole game, on 4 KB boundaries (O_DIRECT) */
+		long off = size > SAMPLE_SIZE ? (size - SAMPLE_SIZE) / (SAMPLES - 1) * i / 4096 * 4096 : 0;
+		long len = size - off < SAMPLE_SIZE ? size - off : SAMPLE_SIZE;
+		ssize_t got = pread(fd, a, direct ? (len + 511) / 512 * 512 : len, off);
+		if (got < 0 && errno == EINVAL && direct && i == 0) {
+			/* O_DIRECT refused at read time: plain reads, cache dropped */
+			close(fd);
+			sq_drop_cache(cart);
+			fd = open(cart, O_RDONLY);
+			direct = 0;
+			if (fd < 0) {
+				same = -1;
+				break;
+			}
+			got = pread(fd, a, len, off);
+		}
+		if (got < len || pread(cfd, b, len, off) != len)
+			same = -1;
+		else if (memcmp(a, b, len) != 0)
+			same = 0;
+	}
+out:
+	if (fd >= 0)
+		close(fd);
+	if (cfd >= 0)
+		close(cfd);
+	free(a);
+	free(b);
+	return same;
 }

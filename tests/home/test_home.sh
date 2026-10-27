@@ -159,6 +159,18 @@ LoadMedium Golden_Sun.gba 65536
 RunHome "sleep:900 shot:home-reading quit"
 Check "shown while it's read (no crash)" Equal "$RC" 0
 
+echo "a cartridge that can't be read"
+NewHomeSandbox
+SetCfg CART_AUTOLOAD 0
+LoadMedium notes.txt 4096
+"$LIB_DIR/cart-event" reconcile
+RunHome "sleep:2500 shot:home-unreadable quit"
+Check "mounted but no game on it: said so" Contains "$LOG_DIR/launcher.log" "has no game on it"
+mkdir -p "$RUN_DIR"
+printf 'OK=0\nCouldn'"'"'t copy the cartridge.\nreading the cartridge: Input/output error\n' > "$RUN_DIR/cart-error.txt"
+RunHome "shot:home-copy-failed quit"
+Check "a failed copy is shown, once" test ! -f "$RUN_DIR/cart-error.txt"
+
 echo "options: deleting a game"
 NewHomeSandbox
 # Opens on Game Boy Advance (nothing played): A in, Select, down down = Delete

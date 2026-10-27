@@ -49,7 +49,7 @@
 #ifndef CART_RW_CMD
 #define CART_RW_CMD	"/usr/lib/retronsq/cart-event"
 #endif
-#define VERSION_FILE	"/etc/retronsq-version"		/* "Retron SQ CFW v0.3.3 beta" */
+#define VERSION_FILE	"/etc/retronsq-version"		/* "Retron SQ CFW v0.3.4 beta" */
 
 /* Leave RetroArch so sq-session takes over. SIGTERM makes RetroArch exit
  * cleanly (saving), like sq-session's own stop. Tests replace it. */
@@ -123,7 +123,7 @@ static char work_title[COLS + 1];
 static struct sq_meter meter;		/* "MB of MB", speed and time left */
 
 static int frame_count = 0;
-static char fw_version[COLS + 1];	/* "v0.3.3 beta", shown in the header */
+static char fw_version[COLS + 1];	/* "v0.3.4 beta", shown in the header */
 
 /* --- small helpers ------------------------------------------------------ */
 

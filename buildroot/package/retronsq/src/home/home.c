@@ -57,6 +57,8 @@
 #define WARMUP_MS	1500	/* at start: present every 100 ms this long */
 #define DONE_MS		700	/* a finished copy shows "Done" this long */
 #define WRITE_CHECK	SQ_RUN_DIR "/write-check.txt"	/* see PrepareCart */
+#define CART_ERROR	SQ_RUN_DIR "/cart-error.txt"	/* see CartError in common.sh */
+#define STUCK_MS	30000	/* reading longer than this: the slot can't read it */
 
 /* Layout (1280x720) */
 #define HEAD_H		64
@@ -530,12 +532,15 @@ static void reload_page(void)
  */
 struct seen {
 	struct sq_cart cart;
+	enum sq_reader_state state;
 	int reading;		/* the slot is reading a cartridge, not mounted yet */
 	int writable;		/* sq_reader_writable() */
 	int takes[2];		/* sq_cart_write_known(): saves, games */
 	char crc[16];		/* the slot's checksum, as shown */
 	int checked;		/* a write check ran (only once per insert) */
 	struct sq_result check;
+	int error;		/* the cartridge couldn't be read: say so */
+	struct sq_result error_msg;
 };
 static pthread_t poller;
 static int poller_running;
@@ -558,8 +563,11 @@ static void look(struct seen* now, const struct seen* last, int first)
 
 	memset(now, 0, sizeof(*now));
 	sq_cart_scan(&now->cart);
-	/* Seen by the slot but not mounted yet: it is being read */
-	now->reading = !now->cart.present && sq_reader_state() == SQ_READER_PENDING;
+	/* The slot is on USB (it only connects with a cartridge in) but no
+	 * cartridge is mounted yet: it is being read */
+	now->state = sq_reader_state();
+	now->reading = !now->cart.present &&
+		(now->state == SQ_READER_PENDING || now->state == SQ_READER_EMPTY);
 	now->writable = sq_reader_writable();
 	now->takes[0] = sq_cart_write_known(&now->cart, 0);
 	now->takes[1] = sq_cart_write_known(&now->cart, 1);
@@ -577,6 +585,82 @@ static void look(struct seen* now, const struct seen* last, int first)
 	}
 }
 
+/* A message for "the cartridge couldn't be read" */
+static void read_error(struct sq_result* r, const char* headline, const char* why)
+{
+	memset(r, 0, sizeof(*r));
+	snprintf(r->line[0], sizeof(r->line[0]), "%s", headline);
+	snprintf(r->line[1], sizeof(r->line[1]), "%s", why);
+	snprintf(r->line[2], sizeof(r->line[2]), "Take it out, clean its contacts and");
+	snprintf(r->line[3], sizeof(r->line[3]), "insert it again.");
+}
+
+/* A message file left by the session or cart-event (CartError, PrepareCart's
+ * write check): OK=0|1, then up to 4 lines. Taken (deleted) once read. */
+static int take_message(const char* file, struct sq_result* r)
+{
+	char path[SQ_PATH_LEN], line[128];
+	FILE* fp = fopen(sq_path(path, sizeof(path), file), "r");
+	int i = 0;
+
+	if (!fp)
+		return 0;
+	memset(r, 0, sizeof(*r));
+	while (fgets(line, sizeof(line), fp)) {
+		line[strcspn(line, "\r\n")] = '\0';
+		if (!strncmp(line, "OK=", 3))
+			r->ok = line[3] == '1';
+		else if (i < 4)
+			snprintf(r->line[i++], sizeof(r->line[0]), "%s", line);
+	}
+	fclose(fp);
+	unlink(path);
+	return i > 0;
+}
+
+/*
+ * When a cartridge can't be read, say so (once): the slot mounted it but
+ * shows no game (twice in a row, so a mount in progress doesn't count), it
+ * has been "reading" for STUCK_MS, or the session or cart-event left a
+ * message (a failed copy or mount).
+ */
+static void check_read_error(struct seen* now)
+{
+	static Uint32 reading_since;
+	static int stuck_said, nogame_polls;
+	static unsigned nogame_said = (unsigned)-1;
+	Uint32 t = SDL_GetTicks();
+
+	if (now->reading) {
+		if (!reading_since)
+			reading_since = t ? t : 1;
+		else if (t - reading_since >= STUCK_MS && !stuck_said) {
+			stuck_said = 1;
+			now->error = 1;
+			read_error(&now->error_msg, "The slot couldn't read the cartridge.",
+				"It has been trying for 30 seconds.");
+			sq_log_sd("home: the slot has been reading the cartridge for 30 s");
+		}
+	} else {
+		reading_since = 0;
+		if (now->state == SQ_READER_NONE)
+			stuck_said = 0;
+	}
+	if (now->state == SQ_READER_READY && !now->cart.present) {
+		if (++nogame_polls >= 2 && now->cart.generation != nogame_said) {
+			nogame_said = now->cart.generation;
+			now->error = 1;
+			read_error(&now->error_msg, "The cartridge couldn't be read.",
+				"The slot shows no game on it.");
+			sq_log_sd("home: the cartridge's drive has no game on it");
+		}
+	} else {
+		nogame_polls = 0;
+	}
+	if (take_message(CART_ERROR, &now->error_msg))
+		now->error = 1;
+}
+
 static void* poller_main(void* arg)
 {
 	struct seen last, now;
@@ -592,15 +676,20 @@ static void* poller_main(void* arg)
 		if (poller_stop)
 			break;
 		look(&now, &last, 0);
-		if (other_cart(&now.cart, &last.cart) || now.reading != last.reading ||
+		check_read_error(&now);
+		if (other_cart(&now.cart, &last.cart) || now.reading != last.reading || now.error ||
 				now.writable != last.writable || now.takes[0] != last.takes[0] ||
 				now.takes[1] != last.takes[1]) {
 			SDL_Event ev;
 			pthread_mutex_lock(&seen_lock);
-			/* A check not yet taken over stays until it is */
+			/* A check or an error not yet taken over stays until it is */
 			if (seen.checked && seen_seq != applied_seq && !now.checked) {
 				now.checked = 1;
 				now.check = seen.check;
+			}
+			if (seen.error && seen_seq != applied_seq && !now.error) {
+				now.error = 1;
+				now.error_msg = seen.error_msg;
 			}
 			seen = now;
 			seen_seq++;
@@ -611,6 +700,7 @@ static void* poller_main(void* arg)
 		}
 		last = now;
 		last.checked = 0;
+		last.error = 0;
 	}
 	return NULL;
 }
@@ -651,6 +741,11 @@ static void apply_cartridge(void)
 		task_result = now.check;
 		dialog = DLG_RESULT;
 	}
+	if (now.error) {
+		task_result = now.error_msg;
+		task_result.ok = 0;
+		dialog = DLG_RESULT;
+	}
 	dirty = 1;
 }
 
@@ -660,6 +755,8 @@ static void start_poller(void)
 {
 	struct seen now;
 	look(&now, &now, 1);
+	if (take_message(CART_ERROR, &now.error_msg))
+		now.error = 1;
 	pthread_mutex_lock(&seen_lock);
 	seen = now;
 	seen_seq = 1;
@@ -1862,24 +1959,9 @@ int main(void)
 	saver_running = pthread_create(&saver, NULL, saver_main, NULL) == 0;
 	start_poller();
 	/* The session checked a save written to the cartridge (PrepareCart,
-	 * when it played it): show the verdict */
-	fp = fopen(sq_path(path, sizeof(path), WRITE_CHECK), "r");
-	if (fp) {
-		char line[128];
-		int i = 0;
-		memset(&task_result, 0, sizeof(task_result));
-		while (fgets(line, sizeof(line), fp)) {
-			line[strcspn(line, "\r\n")] = '\0';
-			if (!strncmp(line, "OK=", 3))
-				task_result.ok = line[3] == '1';
-			else if (i < 4)
-				snprintf(task_result.line[i++], sizeof(task_result.line[0]), "%s", line);
-		}
-		fclose(fp);
-		unlink(path);
-		if (i > 0)
-			dialog = DLG_RESULT;
-	}
+	 * when it played it): show the verdict, unless a read error is shown */
+	if (dialog == DLG_NONE && take_message(WRITE_CHECK, &task_result))
+		dialog = DLG_RESULT;
 
 	/* Open on the cartridge when there is one, else on the games */
 	page = cart.present ? PAGE_CART : PAGE_RECENT;

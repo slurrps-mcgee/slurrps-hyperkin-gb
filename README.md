@@ -1,6 +1,6 @@
 # Retron SQ Custom Firmware
 
-**v0.3.3 beta**: custom firmware for the Hyperkin Retron SQ. Play Game Boy,
+**v0.3.4 beta**: custom firmware for the Hyperkin Retron SQ. Play Game Boy,
 Game Boy Color and Game Boy Advance cartridges as before, or ROMs from the SD
 card with no cartridge at all, from a simple home screen, with the full
 RetroArch menu on Start + Select in any game.
@@ -18,6 +18,16 @@ Changing or extending it: [docs/DEVELOPING.md](docs/DEVELOPING.md).
 > works and what doesn't.
 
 ## What's new
+
+**In v0.3.4:**
+
+| | |
+| --- | --- |
+| **The SD card really fills the card (for real this time)** | The RETRONSQ drive stayed at 64 MB on every card: right after the partition was grown, the boot script lost the partition's size and skipped the resize without a word. Fixed, logged, and tested at 32 GB and 128 GB. Cards of 32, 64 and 128 GB work. |
+| **"Reading cartridge..." sooner** | It shows as soon as the cartridge slot connects, even before the cartridge can be opened. (The slot itself reads the whole cartridge before it connects, so a 16 MB Pokémon game takes a few seconds longer than an 8 MB one: see [Loading times](#loading-times).) |
+| **A message when a cartridge can't be read** | Instead of nothing happening: the slot shows no game, keeps reading for 30 s, the copy fails, or its drive can't be opened. |
+| **Faster, real checks of a cartridge copy** | The second read used to come from memory, not the cartridge, so it proved nothing and wasted time. Now the copy is checked against the usual checksum variants, then by reading 32 parts of the cartridge again (about 1 MB) instead of all of it. |
+| **Copy speed in the log** | `launcher.log` says how fast each cartridge was read. |
 
 **In v0.3.3:**
 
@@ -108,7 +118,7 @@ froze on start in both. Use v0.2.2 or later.
 2. Write the `.img` to the console's microSD card with a USB card reader:
    - **Fedora/GNOME:** open *Disks*, select the card, ⋮ → *Restore Disk Image…*
    - **Any OS:** balenaEtcher (or Rufus on Windows)
-   - **Terminal:** `sudo dd if=RetronSQ-CFW-v0.3.3-sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress`
+   - **Terminal:** `sudo dd if=RetronSQ-CFW-v0.3.4-sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress`
      (find `/dev/sdX` with `lsblk` first; it gets overwritten)
 3. Put the card in the console and switch it on.
 
@@ -120,7 +130,7 @@ new size (keeping any files already on it, such as games you copied on
 before switching on) and may restart once by itself. After that, the card
 shows up on a PC as **RETRONSQ** with its full size.
 
-**A card stuck at 64 MB** (v0.3.2 or older, see *What's new*): a fresh image
+**A card stuck at 64 MB** (v0.3.3 or older, see *What's new*): a fresh image
 of this version grows it on its first boot. Writing an image replaces
 everything on the card, so copy your files off the RETRONSQ drive first
 (saves, `retronsq.cfg`, games) and back on afterwards.
@@ -340,21 +350,43 @@ shows its progress: KB or MB done, speed, time left, and the step it's on.
 
 The cartridge slot gives a checksum of the cartridge's game (the `.crc`
 file next to the game on its drive, shown on the Cartridge page). The
-console computes the same kind of checksum of what it reads (the slot's own
-CRC-32 variant, taken from the stock firmware) and compares the two:
+console computes a checksum of what it read and compares the two:
 
-- **They match:** the copy is exact.
-- **They don't match, but a second read gives exactly the same data:** the
-  copy is kept and trusted (*"Checked by reading it twice"*). A dirty
-  contact makes reads differ from each other; a mismatch that repeats
-  exactly means it's the slot's checksum that disagrees, which happens with
-  some genuine cartridges.
-- **The two reads differ:** the copy is kept so the game runs, and the
-  message asks you to clean the cartridge's contacts and copy again.
+- **They match:** the copy is exact. If the usual algorithm (taken from the
+  stock firmware) doesn't match, the console also tries the other common
+  CRC-32 variants on the copy (a few seconds, no cartridge reads) and logs
+  which one the slot uses. So far every genuine cartridge mismatched the
+  stock algorithm, so this is how the right one will be found: please send
+  `logs/launcher.log` ("checksum probe").
+- **No checksum matches, but reading parts of the cartridge again gives
+  exactly the same data:** the copy is kept and trusted (*"Checked by
+  reading it again"*). 32 parts of 32 KB spread over the game are read
+  straight from the cartridge (not from memory), about 1 MB, a few seconds.
+  A dirty contact makes reads differ; a mismatch that repeats exactly means
+  it's the slot's checksum that disagrees.
+- **They differ:** the whole cartridge is read again; if that still differs,
+  the copy is kept so the game runs, and the message asks you to clean the
+  cartridge's contacts and copy again.
 
 Every mismatch is logged in `logs/launcher.log` with both checksums and the
 game's size. The stock firmware did the same check but never told you: it
 silently copied the cartridge again on every start.
+
+### Loading times
+
+After a cartridge goes in, two things take time:
+
+1. **The slot reads the cartridge by itself before it connects** to the
+   console (it serves the game's checksum the moment it appears, so it has
+   read the whole game). Until then the console can't see anything, so
+   there is a pause before *Reading cartridge...* shows; it is longer for
+   bigger games (16 MB Pokémon carts) than smaller ones (8 MB). The console
+   has no other way to notice a cartridge.
+2. **The first copy to the SD card** runs at the slot's speed, about
+   0.25 MB/s here (measured: about a minute for a 16 MB game). After that the
+   game starts from the SD card copy at once, unless the cartridge changed.
+   `logs/launcher.log` records the speed of every copy ("copied in N s
+   (X MB/s)").
 
 ### Saves are kept on the SD card
 
