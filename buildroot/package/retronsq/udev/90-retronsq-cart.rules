@@ -1,0 +1,14 @@
+# Retron SQ cartridge reader: a USB mass-storage device on port 3-1 of the
+# RK3128's OHCI (USB 1.1) controller. Every block event for it goes to
+# cart-event, which mounts the cartridge read-only at /media/cart (see that
+# script). This replaces the stock usbmount setup.
+
+# Poll the reader for media changes once a second. Without this the kernel
+# never notices a cartridge swap on a reader that stays connected.
+SUBSYSTEM=="block", KERNEL=="sd*", ENV{DEVTYPE}=="disk", ACTION=="add", \
+	DEVPATH=="/devices/platform/101e0000.usb/usb3/3-1/3-1:1.1/*", \
+	ATTR{events_poll_msecs}="1000"
+
+SUBSYSTEM=="block", KERNEL=="sd*", \
+	DEVPATH=="/devices/platform/101e0000.usb/usb3/3-1/3-1:1.1/*", \
+	RUN+="/usr/lib/retronsq/cart-event $env{ACTION} %k"

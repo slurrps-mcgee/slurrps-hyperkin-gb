@@ -1,12 +1,15 @@
 # Build environment for this 2018 Rockchip SDK (Buildroot 2018.02, kernel
 # 4.4). Modern distros' GCC/glibc/Python can't build its host tools, so use
 # the Ubuntu release the SDK was made for. See build-in-container.sh.
-FROM docker.io/library/ubuntu:18.04
+# librsvg2-bin and the DejaVu fonts render the boot splash, which carries
+# the firmware version (see buildroot/package/retronsq/splash/).
+FROM docker.io/library/ubuntu:18.04 AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
 	bc bison build-essential ca-certificates chrpath cmake cpio \
 	device-tree-compiler diffstat dosfstools e2fsprogs expect fakeroot file \
+	fonts-dejavu-core librsvg2-bin \
 	flex g++-multilib gawk gcc-multilib gdisk genext2fs git libncurses5-dev \
 	liblz4-tool libssl-dev locales mtools parted patchelf pkg-config python \
 	python3 rsync squashfs-tools texinfo time unzip wget zip \
@@ -15,3 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 WORKDIR /work
+
+# Tests (tests/run-all.sh): the firmware's SDL programs built for the host
+# and a virtual display to run them on. A separate stage, so the firmware
+# build never sees host SDL libraries.
+FROM build AS test
+RUN apt-get update && apt-get install -y --no-install-recommends \
+	libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev \
+	xvfb xauth libgl1-mesa-dri \
+	&& rm -rf /var/lib/apt/lists/*

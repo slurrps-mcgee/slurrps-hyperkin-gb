@@ -1,0 +1,3 @@
+#!/bin/sh
+# Test stub for amixer: records the call (AudioRoute)
+echo "amixer $*" >> "$SQ_ROOT/calls.log"

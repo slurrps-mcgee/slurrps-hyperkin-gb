@@ -1,4 +1,0 @@
-#echo "usb mount start" > /dev/console
-source /etc/check_dumper.sh
-CartInserted
-echo "usb mount done" > /dev/console

@@ -1,7 +1,13 @@
 #!/bin/bash
+#
+# Run by udev when the display connection changes (60-drm.rules). Picks the
+# HDMI output and its video mode, routes audio to HDMI or the headphone jack
+# (AudioRoute in common.sh, shared with S50ui), and once booted makes sure
+# sq-session is running so a game shows up as soon as a screen is connected.
+#
 
 source /usr/bin/av_helper.sh
-source /etc/check_dumper.sh
+source /usr/lib/retronsq/common.sh
 PREFERED_CONNECTORS="hdmi internal"
 PREFERED_MODES="1280x720 1024x 1280x1024 800x600 1920x1080 [0-9]"
 CONNECTOR_ID=
@@ -50,28 +56,9 @@ alsa_set_playback $PLAYBACK_NAME
 
 /usr/bin/volctrl.sh
 
-if [ `cat /sys/class/switch/h2w/state` == 2 ]; then
-        if [ $CONNECTOR_TYPE == "hdmi" ]; then
-                amixer cset name='Playback Path' 'OFF'
-		if [ -f /tmp/boot_complete ]; then
-#			echo "HDMI trigger start" > /dev/console
-			StartLauncher
-#			echo "HDMI trigger done" > /dev/console
-		fi
-        else
-	        amixer cset name='Playback Path' 'HP'
-        fi
-else
-	if [ $CONNECTOR_TYPE == "hdmi" ]; then
-		amixer cset name='Playback Path' 'OFF'
-		if [ -f /tmp/boot_complete ]; then
-#			echo "HDMI trigger start" > /dev/console
-			StartLauncher
-#			echo "HDMI trigger done" > /dev/console
-		fi
-	else
-		amixer cset name='Playback Path' 'HP'
-	fi
+AudioRoute
+if [ -f /tmp/boot_complete ]; then
+	StartSession
 fi
 
 exit 0

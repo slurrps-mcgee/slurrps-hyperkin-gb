@@ -1,0 +1,41 @@
+# Run the firmware's tests (tests/run-all.sh) on every push and pull
+# request. Only the files the tests use are checked out, not the whole
+# multi-gigabyte SDK, and nothing is built for the console, so this takes a
+# few minutes. See docs/DEVELOPING.md.
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out what the tests use
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /build-in-container.sh
+            /docker/
+            /tests/
+            /VERSION
+            /buildroot/package/retronsq/
+            /buildroot/package/retroarch/
+            /buildroot/package/rockchip/partinit/
+            /buildroot/board/rockchip/common/base/busybox.config
+            /buildroot/board/rockchip/rk3128/fs-overlay/usr/bin/
+            /buildroot/dl/busybox-1.27.2.tar.bz2
+            /device/rockchip/userdata/
+
+      - name: Run the tests
+        env:
+          CONTAINER_ENGINE: podman
+        run: ./build-in-container.sh test

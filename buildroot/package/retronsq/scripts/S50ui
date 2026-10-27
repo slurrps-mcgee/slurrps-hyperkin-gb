@@ -1,0 +1,32 @@
+#!/bin/sh
+#
+# Boot script for the game UI (stock name kept). Routes audio, shows the
+# boot splash, then hands over to sq-session, which runs games from here on
+# (see /usr/lib/retronsq/common.sh).
+#
+. /usr/lib/retronsq/common.sh
+
+case "$1" in
+  start)
+	printf "Starting ui: "
+	export XDG_CONFIG_HOME=/userdata/
+	amixer cset name='Master Playback Volume' 99 > /dev/null
+	amixer cset name='HDMI Playback Volume' 99 > /dev/null
+	AudioRoute
+	cat /etc/retronsq-version > /dev/console
+	# Boot splash (with the firmware version) stays up until RetroArch or
+	# the loading screen takes over; -e scales it up on 1080p screens
+	/usr/bin/fbv -c -i -e -s 1 /etc/retronsq-splash.png
+	# Runs in the background, so the rest of the boot doesn't wait for it
+	StartSession
+	;;
+  stop)
+	# Stop the session and RetroArch (which saves the game on the way out)
+	StopSession
+	printf "ui stop finished"
+	;;
+  *)
+	echo "Usage: $0 {start|stop}"
+	exit 1
+	;;
+esac

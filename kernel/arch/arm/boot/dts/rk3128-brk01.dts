@@ -10,7 +10,7 @@
 
 	chosen {
 		//bootargs = "earlycon=uart8250,mmio32,0x20060000 console=ttyFIQ0 loglevel=7 root=PARTUUID=614e0000-0000-4b53-8000-1d28000054a9 rootwait";
-		bootargs = "console=ttyFIQ0 loglevel=7 swiotlb=1 root=PARTUUID=614e0000-0000-4b53-8000-1d28000054a9 rootwait";
+		bootargs = "console=ttyFIQ0 loglevel=7 swiotlb=1 root=PARTUUID=614e0000-0000-4b53-8000-1d28000054a9 rootwait usb-storage.delay_use=0";
 	};
 
 	adc-vol {

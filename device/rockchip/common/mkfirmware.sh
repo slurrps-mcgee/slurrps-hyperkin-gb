@@ -1,4 +1,10 @@
 #!/bin/bash
+#
+# mkfirmware.sh <BoardConfig.mk>: gather every partition image into rockdev/
+# (called by build.sh). Built images are linked there with relative links, so
+# rockdev/ works both inside the build container and on the host; oem.img and
+# userdata.img are generated here from their directories.
+#
 
 set -e
 

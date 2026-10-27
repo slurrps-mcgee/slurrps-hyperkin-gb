@@ -11,6 +11,14 @@ RETROARCH_SITE = $(TOPDIR)/package/retroarch/src
 RETROARCH_VERSION = 3e27a504ed3b3675d377e985094f3fdb267237bc
 RETROARCH_SITE_METHOD = local
 
+# The sources in src/ are built as they are: Buildroot never applies patches
+# to a local-source package. The 000N-*.patch files next to this file are
+# already applied in src/ and are kept as the record of every change made to
+# upstream RetroArch (see docs/DEVELOPING.md):
+#   0001 udev input: alternative keyboards (stock Hyperkin)
+#   0002 FPS in the verbose log (stock Hyperkin)
+#   0003 save RAM written atomically: tmp + fsync + rename (Retron SQ CFW)
+
 RETROARCH_DEPENDENCIES = host-pkgconf
 
 RETROARCH_CONF_OPTS += --disable-oss

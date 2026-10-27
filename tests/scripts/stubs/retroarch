@@ -1,0 +1,55 @@
+#!/bin/sh
+# Test stub for RetroArch 1.7.4 as built for the console. Records its
+# arguments in $SQ_ROOT/ra-calls and what happens to it in ra-events, and
+# copies the real one's behaviour where the firmware depends on it:
+#
+#   - With stdin_cmd_enable on (in -c's config, then --appendconfig's, the
+#     last one wins) it reads stdin with a blocking read every frame: this
+#     build has no networking, so stdin is never made non-blocking. A stdin
+#     that never ends (a FIFO or pipe) freezes it for good: "HANG", and a
+#     SIGTERM is only noted. (v0.2.0's bug.)
+#   - One SIGTERM is a normal quit that writes the save: "TERM", exit 0.
+#     A second one always exits at once without saving: "TERM2".
+#   - While $SQ_ROOT/ra-stuck exists it is stuck (ignores SIGTERM), like a
+#     crashed core, until SIGKILL.
+echo "$*" >> "$SQ_ROOT/ra-calls"
+echo $$ > "$SQ_ROOT/fake-ra.pid"
+
+# Effective stdin_cmd_enable: the config, then the appended one
+config= append=
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-c) config=$2; shift ;;
+		--appendconfig=*) append=${1#--appendconfig=} ;;
+	esac
+	shift
+done
+stdin_cmd=$(cat "$config" "$append" 2> /dev/null | tr -d '\r' |
+	sed -n 's/^stdin_cmd_enable *= *"\{0,1\}\([a-z]*\)"\{0,1\}.*/\1/p' | tail -n 1)
+
+hung=0
+if [ "$stdin_cmd" = true ] && [ -p /proc/$$/fd/0 ]; then
+	echo HANG >> "$SQ_ROOT/ra-events"
+	hung=1
+fi
+
+terms=0
+OnTerm(){
+	terms=$((terms + 1))
+	if [ $terms -ge 2 ]; then
+		# The handler itself calls exit(1): no save
+		echo TERM2 >> "$SQ_ROOT/ra-events"
+		exit 1
+	fi
+	if [ $hung = 1 ] || [ -f "$SQ_ROOT/ra-stuck" ]; then
+		echo "TERM ignored" >> "$SQ_ROOT/ra-events"
+		return
+	fi
+	echo TERM >> "$SQ_ROOT/ra-events"
+	exit 0
+}
+trap OnTerm TERM
+
+while :; do
+	usleep 100000
+done

@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Boot splash for the Retron SQ custom firmware, shown by S50ui while the
+  console starts. @VERSION_LABEL@ is replaced with the firmware version ("v0.1.0 beta") at build
+  time (see retronsq.mk), then rendered to /etc/retronsq-splash.png.
+  1280x720: the console's preferred HDMI mode; fbv enlarges it for 1080p.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1026"/>
+      <stop offset="0.55" stop-color="#151a3f"/>
+      <stop offset="1" stop-color="#2a1145"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffcf4a"/>
+      <stop offset="1" stop-color="#ff7a3d"/>
+    </linearGradient>
+    <linearGradient id="cart" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d9dce6"/>
+      <stop offset="1" stop-color="#9aa0b4"/>
+    </linearGradient>
+    <linearGradient id="label" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5b6cff"/>
+      <stop offset="1" stop-color="#b14bff"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+    <pattern id="stripes" width="28" height="28" patternUnits="userSpaceOnUse" patternTransform="rotate(-35)">
+      <rect width="28" height="28" fill="none"/>
+      <rect width="9" height="28" fill="#ffffff" opacity="0.025"/>
+    </pattern>
+  </defs>
+
+  <!-- background -->
+  <rect width="1280" height="720" fill="url(#bg)"/>
+  <rect width="1280" height="720" fill="url(#stripes)"/>
+
+  <!-- cartridge -->
+  <g transform="translate(150 196) rotate(-8 120 160)">
+    <path d="M0 18 a18 18 0 0 1 18 -18 h168 l36 36 v262 a18 18 0 0 1 -18 18 h-186 a18 18 0 0 1 -18 -18 z" transform="translate(10 18)" fill="#000000" opacity="0.55" filter="url(#shadow)"/>
+    <path d="M0 18 a18 18 0 0 1 18 -18 h168 l36 36 v262 a18 18 0 0 1 -18 18 h-186 a18 18 0 0 1 -18 -18 z" fill="url(#cart)"/>
+    <rect x="22" y="22" width="150" height="10" rx="5" fill="#ffffff" opacity="0.35"/>
+    <rect x="28" y="62" width="184" height="150" rx="10" fill="url(#label)"/>
+    <text x="120" y="128" font-family="DejaVu Sans" font-weight="bold" font-size="40" fill="#ffffff" text-anchor="middle" letter-spacing="4">SQ</text>
+    <rect x="58" y="148" width="124" height="6" rx="3" fill="#ffffff" opacity="0.7"/>
+    <rect x="78" y="164" width="84" height="6" rx="3" fill="#ffffff" opacity="0.45"/>
+    <g fill="#7e8499">
+      <rect x="40" y="246" width="12" height="54" rx="3"/>
+      <rect x="62" y="246" width="12" height="54" rx="3"/>
+      <rect x="84" y="246" width="12" height="54" rx="3"/>
+      <rect x="106" y="246" width="12" height="54" rx="3"/>
+      <rect x="128" y="246" width="12" height="54" rx="3"/>
+      <rect x="150" y="246" width="12" height="54" rx="3"/>
+      <rect x="172" y="246" width="12" height="54" rx="3"/>
+      <rect x="194" y="246" width="12" height="54" rx="3"/>
+    </g>
+  </g>
+
+  <!-- title -->
+  <text x="500" y="292" font-family="DejaVu Sans" font-weight="bold" font-size="92" fill="#ffffff" letter-spacing="4">RETRON SQ</text>
+  <rect x="504" y="318" width="600" height="8" rx="4" fill="url(#accent)"/>
+  <text x="504" y="382" font-family="DejaVu Sans" font-size="36" fill="#c9cdf0" letter-spacing="9">CUSTOM FIRMWARE</text>
+
+  <!-- version -->
+  <rect x="504" y="418" width="300" height="62" rx="31" fill="url(#accent)"/>
+  <text x="654" y="461" font-family="DejaVu Sans" font-weight="bold" font-size="32" fill="#151a3f" text-anchor="middle">@VERSION_LABEL@</text>
+  <text x="506" y="536" font-family="DejaVu Sans" font-size="26" fill="#8f95c4">Game Boy · Game Boy Color · Game Boy Advance</text>
+
+  <!-- footer -->
+  <text x="640" y="672" font-family="DejaVu Sans" font-size="22" fill="#6f75a8" text-anchor="middle">github.com/slurrps-mcgee/slurrps-hyperkin-gb</text>
+</svg>

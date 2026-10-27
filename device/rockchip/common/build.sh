@@ -59,12 +59,20 @@ function build_uboot(){
 	fi
 }
 
+# Build the single file to write to a microSD card:
+#   RetronSQ-CFW-v<version>-sdcard.img (and a .zip of it) in rockdev/
+# (version from RETRONSQ_VERSION or the VERSION file)
+# Layout: the bootloader (idbloader) at sector 64, then GPT partitions
+# uboot, trust, boot (kernel), rootfs and userdata (FAT32). userdata is only
+# ~65M here; on first boot S21mountall grows it to the end of the card.
 function build_sdcard(){
 	if [ "x$RK_KERNEL_DTS" == "xrk3128-brk01" ];then
 		SDCARD_SIZE=128
-		date=$(date '+%Y%m%d')
-		SDCARD_IMG="$date-$RK_KERNEL_DTS-sdcard-${SDCARD_SIZE}MB${FACTORY}.img"
-		SDCARD_ZIP_IMG="$date-rk3128-brk01-sdcard-${SDCARD_SIZE}MB${FACTORY}.zip"
+		VERSION=${RETRONSQ_VERSION:-$(cat $TOP_DIR/VERSION 2>/dev/null)}
+		SDCARD_IMG="RetronSQ-CFW-v${VERSION}-sdcard${FACTORY}.img"
+		SDCARD_ZIP_IMG="RetronSQ-CFW-v${VERSION}-sdcard${FACTORY}.zip"
+		# drop images of earlier versions
+		rm -f rockdev/RetronSQ-CFW-*-sdcard*.img rockdev/RetronSQ-CFW-*-sdcard*.zip
 		DDR_BIN="../rkbin/bin/rk3128-sdcard/rk3128_ddr_300MHz_v2.09_uart0_20181106.bin"
 		MINI_BIN="../rkbin/bin/rk3128-sdcard/rk312x_miniloader_v2.54_181106.bin"
 		cd rockdev/
@@ -75,8 +83,11 @@ function build_sdcard(){
 		parted -s $SDCARD_IMG mkpart boot      12M 20M
 		parted -s $SDCARD_IMG mkpart rootfs    20M 60M
 		parted -s $SDCARD_IMG mkpart userdata    60M ${SDCARD_SIZE}M
+		# The kernel finds its rootfs by this partition GUID (parameter file)
 		sgdisk --partition-guid=4:614e0000-0000-4b53-8000-1d28000054a9 $SDCARD_IMG
 
+		# First-stage loader for SD boot: DDR init + miniloader, in the
+		# format the RK3128 boot ROM looks for at sector 64
 		../u-boot/tools/mkimage -n rk3128 -T rksd -d $DDR_BIN ./idbloader-sdcard.img
 		cat $MINI_BIN >> ./idbloader-sdcard.img
 

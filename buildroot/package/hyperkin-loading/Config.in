@@ -1,6 +1,0 @@
-config BR2_PACKAGE_HYPERKIN_LOADING
-	bool "hyperkin_loading"
-	help
-
-	hyperkin show loading pictures tools.
-

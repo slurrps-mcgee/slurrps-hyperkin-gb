@@ -1,0 +1,19 @@
+#!/bin/sh
+# Test stub for mount: "mounts" a fake device by copying its files
+# ($SQ_ROOT/fakedev/<dev>/) into the mount point and adding the line the
+# kernel would add to the sandbox's /proc/mounts.
+#   mount -t TYPE -o OPTS /dev/DEV DIR
+while [ $# -gt 2 ]; do
+	case "$1" in
+		-t) type=$2; shift 2 ;;
+		-o) opts=$2; shift 2 ;;
+		*) break ;;
+	esac
+done
+dev=$1 dir=$2
+echo "mount $type $opts $dev $dir" >> "$SQ_ROOT/calls.log"
+src="$SQ_ROOT/fakedev/${dev##*/}"
+[ -d "$src" ] || { echo "mount: $dev: no medium" >&2; exit 32; }
+mkdir -p "$dir"
+cp -a "$src/." "$dir/"
+echo "$dev $dir ${type:-vfat} ${opts:-rw} 0 0" >> "$SQ_ROOT/proc/mounts"

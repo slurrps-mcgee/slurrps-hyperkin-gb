@@ -54,6 +54,36 @@
 #include "tasks_internal.h"
 #include "../managers/cheat_manager.h"
 
+#if defined(__unix__)
+#include <stdio.h>
+/*
+ * Retron SQ: write save RAM so a power cut leaves either the old file or
+ * the new one, never a truncated one. RetroArch used to truncate the .srm
+ * and write it in place, without fsync; on a console that is switched off
+ * at the power that can destroy a save. Write <path>.tmp, fsync, rename.
+ */
+static bool sram_write_atomic(const char *path, const void *data, size_t size)
+{
+   char tmp[PATH_MAX_LENGTH];
+   FILE *fp;
+   bool ok;
+
+   snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+   fp = fopen(tmp, "wb");
+   if (!fp)
+      return false;
+   ok = fwrite(data, 1, size, fp) == size;
+   ok = (fflush(fp) == 0) && ok;
+   ok = (fsync(fileno(fp)) == 0) && ok;
+   ok = (fclose(fp) == 0) && ok;
+   if (ok)
+      ok = rename(tmp, path) == 0;
+   if (!ok)
+      remove(tmp);
+   return ok;
+}
+#endif
+
 #define SAVE_STATE_CHUNK 4096
 
 static struct string_list *task_save_files = NULL;
@@ -158,6 +188,18 @@ static void autosave_thread(void *data)
 
       if (differ)
       {
+#if defined(__unix__)
+         if (first_log)
+         {
+            RARCH_LOG("Autosaving SRAM to \"%s\", will continue to check every %u seconds ...\n",
+                  save->path, save->interval);
+            first_log = false;
+         }
+         else
+            RARCH_LOG("SRAM changed ... autosaving ...\n");
+         if (!sram_write_atomic(save->path, save->buffer, save->bufsize))
+            RARCH_WARN("Failed to autosave SRAM. Disk might be full.\n");
+#else
          /* Should probably deal with this more elegantly. */
          intfstream_t *file = intfstream_open_file(save->path,
                RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_NONE);
@@ -183,6 +225,7 @@ static void autosave_thread(void *data)
             if (failed)
                RARCH_WARN("Failed to autosave SRAM. Disk might be full.\n");
          }
+#endif
       }
 
       slock_lock(save->cond_lock);
@@ -1458,8 +1501,12 @@ bool content_save_ram_file(unsigned slot)
          msg_hash_to_str(MSG_TO),
          ram.path);
 
+#if defined(__unix__)
+   if (!sram_write_atomic(ram.path, mem_info.data, mem_info.size))
+#else
    if (!filestream_write_file(
             ram.path, mem_info.data, mem_info.size))
+#endif
    {
       RARCH_ERR("%s.\n",
             msg_hash_to_str(MSG_FAILED_TO_SAVE_SRAM));

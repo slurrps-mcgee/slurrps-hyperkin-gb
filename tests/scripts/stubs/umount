@@ -1,0 +1,10 @@
+#!/bin/sh
+# Test stub for umount: drops the mount from the sandbox's /proc/mounts and
+# empties the mount point.   umount [-l] DIR
+[ "$1" = -l ] && shift
+echo "umount $1" >> "$SQ_ROOT/calls.log"
+grep -q " $1 " "$SQ_ROOT/proc/mounts" || { echo "umount: $1: not mounted" >&2; exit 1; }
+grep -v " $1 " "$SQ_ROOT/proc/mounts" > "$SQ_ROOT/proc/mounts.new"
+mv "$SQ_ROOT/proc/mounts.new" "$SQ_ROOT/proc/mounts"
+rm -rf "$1"/* "$1"/.[!.]* 2> /dev/null
+exit 0

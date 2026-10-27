@@ -1,5 +1,9 @@
 config BR2_PACKAGE_PARTINIT
 	bool "script for partition init"
-	depends on BR2_PACKAGE_USBMOUNT
 	help
-	  script for partition init.
+	  script for partition init: S21mountall.sh (grow, check and mount the
+	  partitions), the fstab and the /dev/block/by-name udev rules.
+
+	  (Stock Rockchip made this depend on usbmount, which the Retron SQ
+	  firmware doesn't use; with that dependency, removing usbmount
+	  silently dropped this package.)

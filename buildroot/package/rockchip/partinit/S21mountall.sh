@@ -1,8 +1,19 @@
 #!/bin/sh
+#
+# Early boot (S21): get the partitions in /etc/fstab ready and mount them.
+#   1. grow_userdata_part: on the first boot from the SD card image, stretch
+#      the userdata partition to the end of the card
+#   2. resizeall:         grow each filesystem to fill its partition
+#   3. checkall:          fsck the filesystems
+#   4. mountall:          mount everything
+#   5. save_boot_log:     copy this boot's log to logs/boot.log on the card
+# then touch /tmp/boot_complete, which the cartridge hooks and HDMI hotplug
+# wait for before starting games.
 
 # Uncomment below to see more logs
 # set -x
 
+# Grow an ext2/3/4 filesystem to its partition, once (the label marks it done)
 resize_e2fs()
 {
 	DEV=$1
@@ -30,21 +41,33 @@ resize_e2fs()
 	tune2fs $DEV -L $PART_NAME
 }
 
+# le_uint DEV OFFSET BYTES: little-endian unsigned number at OFFSET in DEV.
+# hexdump, because the console's BusyBox od has none of -A/-t/-j/-N
+# (CONFIG_DESKTOP is off): v0.1/v0.2 used od here and never expanded the FAT.
+le_uint()
+{
+	hexdump -s $2 -n $3 -e "1/$3 \"%u\"" $1 2>/dev/null
+}
+
+# fat_fs_size DEV: print the FAT filesystem size in bytes, or nothing when
+# DEV has no FAT boot sector
 fat_fs_size()
 {
 	# Filesystem size in bytes, read straight from the FAT boot sector
 	DEV=$1
 
-	SIG=$(od -An -tx1 -j510 -N2 $DEV | tr -d ' \n')
+	SIG=$(hexdump -s 510 -n 2 -e '2/1 "%02x"' $DEV 2>/dev/null)
 	[ "$SIG" == "55aa" ] || return
 
-	BPS=$(od -An -tu2 -j11 -N2 $DEV | tr -d ' \n')
-	TOTAL=$(od -An -tu2 -j19 -N2 $DEV | tr -d ' \n')
-	[ "$TOTAL" == "0" ] && TOTAL=$(od -An -tu4 -j32 -N4 $DEV | tr -d ' \n')
+	BPS=$(le_uint $DEV 11 2)
+	TOTAL=$(le_uint $DEV 19 2)
+	[ "$TOTAL" == "0" ] && TOTAL=$(le_uint $DEV 32 4)
+	[ -n "$BPS" ] && [ -n "$TOTAL" ] || return
 
 	echo $(($BPS * $TOTAL))
 }
 
+# expand_fat DEV LABEL: make the FAT filesystem on DEV fill its partition
 expand_fat()
 {
 	# There is no reliable in-place FAT resizer, so back up the (small)
@@ -80,6 +103,9 @@ expand_fat()
 	rm -f $BACKUP
 }
 
+# resize_fat DEV MOUNTPOINT PARTNAME MAXSIZE: format a blank FAT partition,
+# or expand a FAT that is smaller than its partition (the freshly flashed
+# 64M userdata image). Used for userdata, which is FAT32 so PCs can read it.
 resize_fat()
 {
 	DEV=$1
@@ -87,6 +113,7 @@ resize_fat()
 	LABEL=RETRONSQ
 
 	SIZE=$(fat_fs_size $DEV)
+	echo "fat: $DEV filesystem ${SIZE:-unreadable} bytes, partition $MAX_SIZE bytes"
 	if [ -z "$SIZE" ];then
 		# Only format a blank partition, never an unreadable one (the
 		# first 64K also covers the superblock of an old ext2 userdata)
@@ -103,6 +130,7 @@ resize_fat()
 	expand_fat $DEV $LABEL
 }
 
+# Grow an NTFS filesystem to its partition (stock, unused here)
 resize_ntfs()
 {
 	DEV=$1
@@ -121,6 +149,7 @@ resize_ntfs()
 	echo y | ntfsresize -f $DEV
 }
 
+# do_resize: one /etc/fstab line (DEV MOUNTPOINT FSTYPE ...) -> resize_<type>
 do_resize()
 {
 	# Not enough args
@@ -168,44 +197,102 @@ grow_userdata_part()
 {
 	# The SD card image is only 128M. On first boot stretch userdata (the
 	# last partition) to the end of the card, before its filesystem is
-	# resized to match.
+	# resized to match. Every step logs what it found, and the log ends up
+	# in logs/boot.log on the SD card (save_boot_log).
+	SGDISK=/usr/sbin/sgdisk
+	PARTX=/usr/sbin/partx
+
 	DEV=$(realpath /dev/block/by-name/userdata 2>/dev/null)
-	[ -b "$DEV" ] || return
+	if [ ! -b "$DEV" ];then
+		echo "grow: no /dev/block/by-name/userdata, nothing to grow"
+		return
+	fi
 	PART_SYS=/sys/class/block/${DEV##*/}
-	PART=$(cat $PART_SYS/partition 2>/dev/null) || return
+	PART=$(cat $PART_SYS/partition 2>/dev/null)
 	DISK_NAME=$(basename $(dirname $(readlink -f $PART_SYS)))
 	DISK=/dev/$DISK_NAME
-	DISK_SIZE=$(cat /sys/class/block/$DISK_NAME/size)
-	START=$(cat $PART_SYS/start)
+	DISK_SIZE=$(cat /sys/class/block/$DISK_NAME/size 2>/dev/null)
+	START=$(cat $PART_SYS/start 2>/dev/null)
 	END=$(($START + $(cat $PART_SYS/size)))
+	echo "grow: userdata is $DEV (partition $PART of $DISK)," \
+		"sectors $START-$END of $DISK_SIZE"
+	if [ -z "$PART" ] || [ -z "$DISK_SIZE" ] || [ -z "$START" ];then
+		echo "grow: couldn't read the partition layout from sysfs"
+		return
+	fi
 
 	# Only the last partition can grow
 	for P in /sys/class/block/$DISK_NAME/$DISK_NAME*; do
 		[ -f $P/start ] || continue
-		[ $(cat $P/start) -gt $START ] && return
+		if [ $(cat $P/start) -gt $START ];then
+			echo "grow: ${P##*/} comes after userdata, not growing"
+			return
+		fi
 	done
 
 	# Less than 16M (in 512 byte sectors) to gain: already done
-	[ $(($DISK_SIZE - $END)) -gt 32768 ] || return
-	which sgdisk >/dev/null || return
+	if [ $(($DISK_SIZE - $END)) -le 32768 ];then
+		echo "grow: userdata already fills $DISK"
+		return
+	fi
+	if [ ! -x $SGDISK ] || [ ! -x $PARTX ];then
+		echo "grow: $SGDISK or $PARTX missing"
+		return
+	fi
 
-	echo Growing $DEV to the end of $DISK...
-	INFO=$(sgdisk -i $PART $DISK) || return
+	echo "grow: growing $DEV to the end of $DISK..."
+	INFO=$($SGDISK -i $PART $DISK)
 	TYPE=$(echo "$INFO" | sed -n 's/^Partition GUID code: \([0-9A-F-]*\).*/\1/p')
 	UUID=$(echo "$INFO" | sed -n 's/^Partition unique GUID: \([0-9A-F-]*\).*/\1/p')
 	NAME=$(echo "$INFO" | sed -n "s/^Partition name: '\(.*\)'/\1/p")
-	[ -n "$TYPE" ] && [ -n "$UUID" ] || return
+	if [ -z "$TYPE" ] || [ -z "$UUID" ];then
+		echo "grow: sgdisk couldn't read partition $PART:"
+		echo "$INFO"
+		return
+	fi
 
 	# Move the backup GPT to the real end of the card, then recreate the
 	# partition with the same start (no realignment), type, GUID and name
-	sgdisk -e $DISK || return
-	sgdisk -a 1 -d $PART -n $PART:$START:0 -t $PART:$TYPE \
-		-u $PART:$UUID -c $PART:"$NAME" $DISK || return
+	if ! $SGDISK -e $DISK;then
+		echo "grow: sgdisk -e failed"
+		return
+	fi
+	if ! $SGDISK -a 1 -d $PART -n $PART:$START:0 -t $PART:$TYPE \
+			-u $PART:$UUID -c $PART:"$NAME" $DISK;then
+		echo "grow: sgdisk failed to recreate partition $PART"
+		return
+	fi
 
 	# Tell the kernel; if that fails the new size shows up after a reboot
-	partx -u -n $PART $DISK || { sync; reboot -f; }
+	if $PARTX -u -n $PART $DISK;then
+		echo "grow: done, userdata is now $(($(cat $PART_SYS/size) / 2048)) MiB"
+	else
+		echo "grow: partx failed, rebooting to use the new partition table"
+		sync
+		reboot -f
+	fi
 }
 
+# Keep this boot's storage log on the SD card (logs/boot.log), so a problem
+# with growing or checking the card can be read on a PC
+save_boot_log()
+{
+	mountpoint -q /userdata || return
+	mkdir -p /userdata/logs
+	{
+		echo "Retron SQ boot log"
+		cat /etc/retronsq-version 2>/dev/null
+		uname -a
+		echo; echo "--- /proc/partitions"; cat /proc/partitions
+		echo; echo "--- grow and resize"; cat $RESIZE_LOG
+		echo; echo "--- check"; cat $CHECK_LOG
+		echo; echo "--- mount"; cat $MOUNT_LOG
+		echo; echo "--- df"; df -h
+	} > /userdata/logs/boot.log 2>&1
+	sync
+}
+
+# Resize every filesystem listed in /etc/fstab
 resizeall()
 {
 	echo "Will now resize all file systems of types $MOUNTALL_USER_FSTYPES"
@@ -214,6 +301,8 @@ resizeall()
 	done < /etc/fstab
 }
 
+# fsck every filesystem listed in /etc/fstab (force_fsck on the kernel
+# command line forces a full check)
 checkall()
 {
 	grep -wq "force_fsck" /proc/cmdline && FORCE_FSCK="-f"
@@ -238,6 +327,7 @@ checkall()
 	# But no worry, we've done that in resize_fat/resize_ntfs ;)
 }
 
+# Mount everything in /etc/fstab
 mountall()
 {
 	echo "Will now mount all file systems of types $MOUNTALL_FSTYPES"
@@ -276,6 +366,7 @@ case "$1" in
 		echo Log saved to $CHECK_LOG
 		mountall 2>&1 | tee $MOUNT_LOG
 		echo Log saved to $MOUNT_LOG
+		save_boot_log
 	fi
 	touch /tmp/boot_complete
 	echo "\n\n S21mountall.sh done\n\n" > /dev/console

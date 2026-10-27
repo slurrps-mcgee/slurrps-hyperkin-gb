@@ -1,0 +1,143 @@
+# Build the firmware and publish it as a GitHub release.
+#
+# Run it by hand: Actions > "Build firmware release" > Run workflow, then
+# enter a version (e.g. 1.2.0). The version goes on the boot splash, in the
+# image names and in the release tag (v1.2.0).
+#
+# The build runs ./build-in-container.sh (Ubuntu 18.04 in podman), the same
+# way as on a PC, and takes about 2-3 hours on a GitHub runner.
+name: Build firmware release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, e.g. 1.2.0 (becomes tag v1.2.0)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as a pre-release (0.x versions always are: they're betas)"
+        type: boolean
+        default: false
+      notes:
+        description: "Release notes (optional, shown above the change list)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+# One release build at a time
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      VERSION: ${{ inputs.version }}
+
+    steps:
+      - name: Check the version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Version must look like 1.2.0 or 1.2.0-beta1, got '$VERSION'"
+            exit 1
+          fi
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::Release v$VERSION already exists"
+            exit 1
+          fi
+
+      # The checkout (~5 GB) plus the build (~8 GB) don't fit in a runner's
+      # default free space; remove preinstalled tools this build never uses
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost \
+            /usr/share/swift /usr/local/share/powershell /usr/local/julia* \
+            /opt/microsoft /opt/google /usr/lib/jvm
+          docker system prune -af > /dev/null || true
+          df -h /
+
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # A few minutes; no point spending hours building a broken firmware
+      - name: Run the tests
+        env:
+          CONTAINER_ENGINE: podman
+        run: ./build-in-container.sh test
+
+      - name: Build the firmware
+        env:
+          CONTAINER_ENGINE: podman
+          RETRONSQ_VERSION: ${{ inputs.version }}
+        run: |
+          set -o pipefail
+          ./build-in-container.sh 2>&1 | tee build.log
+
+      - name: Collect the images
+        run: |
+          set -e
+          mkdir dist
+          SD=rockdev/RetronSQ-CFW-v$VERSION-sdcard.zip
+          if [ ! -f "$SD" ] || [ ! -f rockdev/update.img ]; then
+            echo "::error::Build finished without $SD or rockdev/update.img"
+            ls -la rockdev
+            exit 1
+          fi
+          cp "$SD" dist/
+          cp -L rockdev/update.img "dist/RetronSQ-CFW-v$VERSION-update.img"
+          cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Keep the build log and images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RetronSQ-CFW-v${{ inputs.version }}
+          path: |
+            build.log
+            dist/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ inputs.notes }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          {
+            if [ -n "$NOTES" ]; then echo "$NOTES"; echo; fi
+            echo "## Install"
+            echo
+            echo "1. Unzip \`RetronSQ-CFW-v$VERSION-sdcard.zip\`."
+            echo "2. Write the \`.img\` to the console's microSD card (balenaEtcher,"
+            echo "   GNOME Disks *Restore Disk Image*, or \`dd\`)."
+            echo "3. Boot the console. On the first boot the games partition grows to"
+            echo "   fill the card."
+            echo
+            echo "Then put the card in a PC: ROMs go in \`roms/gba\`, \`roms/gbc\`, \`roms/gb\`"
+            echo "on the **RETRONSQ** drive. See the README for everything else."
+            echo
+            echo "\`RetronSQ-CFW-v$VERSION-update.img\` is the same firmware for Rockchip's"
+            echo "RKDevTool / upgrade_tool."
+          } > notes.md
+          FLAGS=""
+          case "$VERSION" in 0.*) PRERELEASE=true ;; esac
+          if [ "$PRERELEASE" = "true" ]; then FLAGS="--prerelease"; fi
+          gh release create "v$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Retron SQ CFW v$VERSION$(case "$VERSION" in 0.*) echo " beta" ;; esac)" \
+            --notes-file notes.md \
+            --generate-notes \
+            $FLAGS

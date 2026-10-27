@@ -1,0 +1,3 @@
+#!/bin/sh
+# Test stub for hdparm: records the call (cart-event sets the reader read-only)
+echo "hdparm $*" >> "$SQ_ROOT/calls.log"

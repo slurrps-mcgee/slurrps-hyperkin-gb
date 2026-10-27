@@ -1,0 +1,110 @@
+#!/bin/sh
+#
+# sq-scan-roms: build RetroArch playlists ("Collections" in the menu) for
+#   - the games on the SD card (userdata/roms), one list per system,
+#   - every cartridge played before (userdata/rom), as "Cartridge Dumps", and
+#   - "Cartridge Tools", which opens the cartridge tools core,
+# so each can be started from Load Content > Collections without browsing
+# folders or picking a core.
+#
+# Run by LaunchMenu (common.sh) every time the menu opens, so games
+# copied onto the card from a PC show up on the next boot. A playlist file
+# is only rewritten when its content changed, to spare the SD card.
+#
+. "${SQ_LIB:-${SQ_ROOT:-}/usr/lib/retronsq}/common.sh"
+
+PLAYLIST_DIR="$R/userdata/retroarch/playlists"
+LIST="$RUN_DIR/roms.list"
+TMP="$RUN_DIR/playlist.tmp"
+TAB=$(printf '\t')
+TOOLS_SQT="$R/usr/share/retronsq/cartridge-tools.sqt"
+
+[ -n "$SQ_ROOT" ] || mountpoint -q /userdata || exit 0
+mkdir -p $PLAYLIST_DIR
+
+# CoreName PATH: the name RetroArch shows for a core ("gpSP", "mGBA"...),
+# read from its .info file next to the cores; falls back to the file name
+CoreName(){
+	local base name
+	base=$(basename "$1" .so)
+	name=$(tr -d '\r' 2> /dev/null < "$USER_CORE_DIR/$base.info" | \
+		sed -n 's/^corename *= *"\(.*\)"/\1/p')
+	echo "${name:-${base%_libretro}}"
+}
+
+# WritePlaylist NAME: read "path<TAB>label<TAB>core path" lines on stdin and
+# write them, sorted by label, to NAME.lpl. RetroArch 1.7.4 uses the old
+# playlist format: six lines per game (path, label, core path, core name,
+# CRC or "DETECT", playlist name). An empty list removes the playlist.
+WritePlaylist(){
+	local out="$PLAYLIST_DIR/$1.lpl" last_core="" core_name=""
+	sort -f -t "$TAB" -k 2 | while IFS="$TAB" read -r path label core; do
+		# Most games share a core; only look its name up when it changes
+		if [ "$core" != "$last_core" ]; then
+			last_core=$core
+			core_name=$(CoreName "$core")
+		fi
+		printf '%s\n%s\n%s\n%s\nDETECT\n%s\n' \
+			"$path" "$label" "$core" "$core_name" "$1.lpl"
+	done > $TMP
+	if [ ! -s $TMP ]; then
+		rm -f "$out" $TMP
+		return
+	fi
+	cmp -s $TMP "$out" || cp $TMP "$out"
+	rm -f $TMP
+}
+
+# Every ROM on the SD card as "system<TAB>path<TAB>label". The system comes
+# from the extension (any case: .GBA works too). A .zip has no telling
+# extension, so it goes by its folder's name (gb, gbc, gba). Hidden files,
+# like the "._" files macOS leaves on FAT cards, are skipped, and so are
+# names with a tab in them (they would break the list format).
+find "$SD_ROM_PATH" -type f 2> /dev/null | awk '
+	{
+		n = split($0, part, "/"); file = part[n]
+		if (substr(file, 1, 1) == "." || index($0, "\t")) next
+		dot = match(file, /\.[^.]*$/)
+		if (!dot) next
+		ext = tolower(substr(file, dot + 1)); label = substr(file, 1, dot - 1)
+		sys = ""
+		if (ext == "gb") sys = "gb"
+		else if (ext == "gbc") sys = "gbc"
+		else if (ext == "gba" || ext == "agb") sys = "gba"
+		else if (ext == "zip") {
+			dir = tolower(part[n - 1])
+			if (dir ~ /gba|advance/) sys = "gba"
+			else if (dir ~ /gbc|color/) sys = "gbc"
+			else if (dir ~ /gb|boy/) sys = "gb"
+		}
+		if (sys != "") printf "%s\t%s\t%s\n", sys, $0, label
+	}' > $LIST
+
+# One playlist per system, every game using that system's default core
+# (GB_CORE/GBC_CORE/GBA_CORE in retronsq.cfg). The names match RetroArch's
+# own database names.
+for sys in gb gbc gba; do
+	case $sys in
+		gb)  name="Nintendo - Game Boy" ;;
+		gbc) name="Nintendo - Game Boy Color" ;;
+		gba) name="Nintendo - Game Boy Advance" ;;
+	esac
+	core=$(SystemCore $sys)
+	grep "^$sys$TAB" $LIST | cut -f 2,3 | sed "s|\$|$TAB$core|" | WritePlaylist "$name"
+done
+rm -f $LIST
+
+# Cartridges loaded before, playable without the cartridge inserted. Each
+# gets the same core it would get from the slot (cart-overrides.txt, gb.txt).
+for rom in "${ROM_PATH}"*.gb "${ROM_PATH}"*.gbc "${ROM_PATH}"*.gba; do
+	[ -f "$rom" ] || continue
+	file=${rom##*/}
+	printf '%s\t%s\t%s\n' "$rom" "${file%.*}" "$(CoreForRom "$file")"
+done | WritePlaylist "Cartridge Dumps"
+
+# Cartridge Tools (play, copy the cartridge, back up / restore saves): a
+# one-entry list that opens the tools core with its launcher file
+TOOLS_CORE=$(ResolveCore sqtools)
+if [ -n "$TOOLS_CORE" ] && [ -f "$TOOLS_SQT" ]; then
+	printf '%s\t%s\t%s\n' "${TOOLS_SQT#$R}" "Cartridge Tools" "$TOOLS_CORE"
+fi | WritePlaylist "Cartridge Tools"

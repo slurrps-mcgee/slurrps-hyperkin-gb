@@ -1,0 +1,6 @@
+#!/bin/sh
+# Test stub for sqload (the loading screen needs a display): does the same
+# cartridge work with sqcart. SQLOAD_DELAY makes the copy take a while.
+[ -n "$SQLOAD_DELAY" ] && sleep "$SQLOAD_DELAY"
+echo "sqload" >> "$SQ_ROOT/calls.log"
+"$SQCART" cache && "$SQCART" import-save

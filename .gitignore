@@ -16,3 +16,4 @@
 # Container build logs and lock
 /build-full*.log
 /.build.lock
+tests/.build/

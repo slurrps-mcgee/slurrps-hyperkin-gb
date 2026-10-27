@@ -1,4 +1,11 @@
 #!/bin/bash
+#
+# mk-userdata.sh <dir> <image> <ext2|fat>: build the userdata partition image
+# from a directory (device/rockchip/userdata/<board>). This board uses fat:
+# a FAT32 image labelled RETRONSQ, so the SD card's game partition can be
+# opened on any PC. The image is kept small (64M+) because S21mountall grows
+# the partition and filesystem to the whole card on first boot.
+#
 
 COMMON_DIR=$(cd "$(dirname "$0")"; pwd)
 if [ -h "$0" ]

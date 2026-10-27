@@ -1,0 +1,13 @@
+config BR2_PACKAGE_RETRONSQ
+	bool "retronsq"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	select BR2_PACKAGE_SDL2
+	select BR2_PACKAGE_SDL2_IMAGE
+	select BR2_PACKAGE_SDL2_TTF
+	select BR2_PACKAGE_DEJAVU
+	select BR2_PACKAGE_DEJAVU_SANS
+	help
+	  The Retron SQ custom firmware's own software: the cartridge
+	  library and tools (libsqcart, sqcart, sqload, Cartridge Tools),
+	  the session that runs games, cartridge hot-plug handling, the
+	  boot script and the boot/loading screens.

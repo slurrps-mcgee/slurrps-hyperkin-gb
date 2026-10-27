@@ -1,0 +1,9 @@
+#!/bin/sh
+#
+# Reset button handler, run by input-event-daemon when the console's reset
+# button (reported as the F3 key) is pressed. Restarts the current game or
+# the menu; see ResetROM in common.sh.
+#
+. "${SQ_LIB:-${SQ_ROOT:-}/usr/lib/retronsq}/common.sh"
+Log "reset button"
+ResetROM

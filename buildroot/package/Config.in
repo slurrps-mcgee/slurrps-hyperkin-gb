@@ -64,7 +64,7 @@ menu "Audio and video applications"
 	source "package/wavpack/Config.in"
 	source "package/yavta/Config.in"
 	source "package/ympd/Config.in"
-	source "package/hyperkin-loading/Config.in"
+	source "package/retronsq/Config.in"
 endmenu
 
 menu "Compressors and decompressors"
