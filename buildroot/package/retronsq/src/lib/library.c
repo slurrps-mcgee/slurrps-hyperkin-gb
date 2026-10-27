@@ -1,17 +1,20 @@
 /*
  * The game library for the home screen (see sqcart.h): games on the SD
- * card, recently played, favorites, and where their box art is.
+ * card, recently played, favorites, where their box art is, the saves,
+ * and deleting games and saves.
  *
  * History and favorites are small text files in SQ_HOME_DIR, one game per
  * line: "<path><TAB><label>", paths as on the console (/userdata/...), so
  * they stay valid whatever $SQ_ROOT is. They are rewritten atomically.
  */
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "sqcart.h"
 
@@ -296,4 +299,201 @@ char* sq_boxart_path(const struct sq_game* g, char* out, size_t len)
 	snprintf(rel, sizeof(rel), "%s/%s/Named_Boxarts/%s.png", SQ_THUMBS_DIR,
 		sq_system_name(g->system), name);
 	return sq_path(out, len, rel);
+}
+
+/* --- saves --------------------------------------------------------------- */
+
+struct save_scan {
+	struct sq_save_file* saves;
+	int count, cap;
+};
+
+static struct sq_save_file* add_save(struct save_scan* s)
+{
+	if (s->count == s->cap) {
+		int cap = s->cap ? s->cap * 2 : 64;
+		struct sq_save_file* more = (struct sq_save_file*)realloc(s->saves, cap * sizeof(*more));
+		if (!more)
+			return NULL;
+		s->saves = more;
+		s->cap = cap;
+	}
+	memset(&s->saves[s->count], 0, sizeof(s->saves[0]));
+	return &s->saves[s->count++];
+}
+
+/* Fill the rest of a save from its path (with $SQ_ROOT) */
+static void save_stat(struct sq_save_file* f, const char* full)
+{
+	struct stat st;
+	snprintf(f->path, sizeof(f->path), "%s", unroot(full));
+	if (stat(full, &st) == 0) {
+		f->size = st.st_size;
+		f->mtime = st.st_mtime;
+	}
+}
+
+/* "Pokemon_Emerald" -> "Pokemon Emerald" (cartridge file names) */
+static void spaces(char* s)
+{
+	for (; *s; s++)
+		if (*s == '_')
+			*s = ' ';
+}
+
+/* Live saves (<game>.srm) under dir, recursively: kind is what to call them */
+static void scan_srm(const char* dir, int depth, int cartridge, struct save_scan* s)
+{
+	char path[SQ_PATH_LEN];
+	struct dirent* d;
+	struct stat st;
+	DIR* di = opendir(dir);
+
+	if (!di)
+		return;
+	while ((d = readdir(di)) != NULL && s->count < MAX_GAMES) {
+		struct sq_save_file* f;
+		char* dot;
+		if (d->d_name[0] == '.')
+			continue;
+		snprintf(path, sizeof(path), "%s/%s", dir, d->d_name);
+		if (stat(path, &st) != 0)
+			continue;
+		if (S_ISDIR(st.st_mode)) {
+			if (depth < MAX_DEPTH)
+				scan_srm(path, depth + 1, cartridge, s);
+			continue;
+		}
+		if (!S_ISREG(st.st_mode) || !sq_ends_with(d->d_name, ".srm") || !(f = add_save(s)))
+			continue;
+		snprintf(f->label, sizeof(f->label), "%s", d->d_name);
+		dot = strrchr(f->label, '.');
+		if (dot)
+			*dot = '\0';
+		if (cartridge) {
+			spaces(f->label);
+			snprintf(f->kind, sizeof(f->kind), "Cartridge save");
+		} else if (strstr(path, "/gba/")) {
+			snprintf(f->kind, sizeof(f->kind), "Game Boy Advance save");
+		} else if (strstr(path, "/gbc/")) {
+			snprintf(f->kind, sizeof(f->kind), "Game Boy Color save");
+		} else if (strstr(path, "/gb/")) {
+			snprintf(f->kind, sizeof(f->kind), "Game Boy save");
+		} else {
+			snprintf(f->kind, sizeof(f->kind), "Game save");
+		}
+		f->live = 1;
+		save_stat(f, path);
+	}
+	closedir(di);
+}
+
+static int compare_saves(const void* a, const void* b)
+{
+	const struct sq_save_file* x = (const struct sq_save_file*)a;
+	const struct sq_save_file* y = (const struct sq_save_file*)b;
+	int c = strcasecmp(x->label, y->label);
+	if (c)
+		return c;
+	if (x->live != y->live)
+		return y->live - x->live;	/* the live save, then its backups */
+	return y->backup - x->backup;		/* newest backup first */
+}
+
+int sq_saves_scan(struct sq_save_file** out)
+{
+	char dir[SQ_PATH_LEN], label[128];
+	struct save_scan s = { NULL, 0, 0 };
+	struct sq_backup list[64];
+	struct dirent* d;
+	DIR* di;
+	int i, n;
+
+	scan_srm(sq_path(dir, sizeof(dir), SQ_ROMS_DIR), 0, 0, &s);
+	scan_srm(sq_path(dir, sizeof(dir), SQ_ROM_DIR), 0, 1, &s);
+
+	/* Backups: saves/<game>/NNN-<kind>.sav */
+	di = opendir(sq_path(dir, sizeof(dir), SQ_SAVES_DIR));
+	while (di && (d = readdir(di)) != NULL) {
+		if (d->d_name[0] == '.')
+			continue;
+		n = sq_backup_list(d->d_name, list, 64);
+		snprintf(label, sizeof(label), "%s", d->d_name);
+		spaces(label);
+		for (i = 0; i < n; i++) {
+			struct sq_save_file* f = add_save(&s);
+			char* p;
+			if (!f)
+				break;
+			snprintf(f->label, sizeof(f->label), "%s", label);
+			snprintf(f->kind, sizeof(f->kind), "Backup #%d (%s)", list[i].number, list[i].kind);
+			for (p = f->kind; *p; p++)
+				if (*p == '-')
+					*p = ' ';
+			f->backup = list[i].number;
+			save_stat(f, list[i].path);
+		}
+	}
+	if (di)
+		closedir(di);
+	if (s.count > 1)
+		qsort(s.saves, s.count, sizeof(*s.saves), compare_saves);
+	*out = s.saves;
+	return s.count;
+}
+
+/* --- deleting ------------------------------------------------------------- */
+
+/* path (on the console) is a file directly or deeper inside dir/ and has
+ * no ".." in it */
+static int inside(const char* path, const char* dir)
+{
+	size_t n = strlen(dir);
+	return !strncmp(path, dir, n) && path[n] == '/' && path[n + 1] && !strstr(path, "/..");
+}
+
+static int remove_file(const char* path, const char* what, struct sq_error* e)
+{
+	char full[SQ_PATH_LEN];
+	if (unlink(sq_path(full, sizeof(full), path)) != 0) {
+		sq_fail(e, errno, "deleting %s", what);
+		return -1;
+	}
+	sq_log_sd("home: deleted %s", path);
+	return 0;
+}
+
+int sq_delete_game(const char* path, struct sq_error* e)
+{
+	char crc[SQ_PATH_LEN], full[SQ_PATH_LEN];
+	char* dot;
+
+	if (!is_game_file(path) || (!inside(path, SQ_ROMS_DIR) && !inside(path, SQ_ROM_DIR))) {
+		sq_fail(e, 0, "only games in roms/ can be deleted");
+		return -1;
+	}
+	if (remove_file(path, "the game", e) != 0)
+		return -1;
+	/* A cartridge copy's checksum goes with it (the copy isn't trusted
+	 * any more: it is read from the cartridge again next time) */
+	if (inside(path, SQ_ROM_DIR)) {
+		snprintf(crc, sizeof(crc), "%s", path);
+		dot = strrchr(crc, '.');
+		if (dot && dot > strrchr(crc, '/'))
+			strcpy(dot, ".crc");
+		unlink(sq_path(full, sizeof(full), crc));
+	}
+	return 0;
+}
+
+int sq_delete_save(const char* path, struct sq_error* e)
+{
+	int live = sq_ends_with(path, ".srm") && (inside(path, SQ_ROMS_DIR) || inside(path, SQ_ROM_DIR));
+	int backup = sq_ends_with(path, ".sav") && inside(path, SQ_SAVES_DIR);
+
+	if (!live && !backup) {
+		sq_fail(e, 0, "only saves in roms/ and saves/ can be deleted");
+		return -1;
+	}
+	return remove_file(path, "the save", e);
 }

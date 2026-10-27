@@ -93,7 +93,11 @@ void sq_meter_text(struct sq_meter* m, long done, unsigned long now_ms, int fini
 {
 	if (done > m->total)
 		done = m->total;
-	snprintf(size, size_len, "%.1f of %.1f MB", done / 1048576.0, m->total / 1048576.0);
+	/* Saves are KB, games MB */
+	if (m->total < 1048576)
+		snprintf(size, size_len, "%ld of %ld KB", (done + 1023) / 1024, (m->total + 1023) / 1024);
+	else
+		snprintf(size, size_len, "%.1f of %.1f MB", done / 1048576.0, m->total / 1048576.0);
 	if (done > 0 && m->first_ms == 0) {
 		m->first_ms = now_ms ? now_ms : 1;
 		m->first_bytes = done;
@@ -148,8 +152,14 @@ void sq_mkdirs(const char* path)
 
 unsigned char* sq_read_all(const char* path, long max, long* size)
 {
+	return sq_read_all_progress(path, max, size, NULL, NULL, 0);
+}
+
+unsigned char* sq_read_all_progress(const char* path, long max, long* size,
+	sq_progress_fn progress, void* ctx, long base)
+{
 	unsigned char* data;
-	long len = sq_file_size(path);
+	long len = sq_file_size(path), got = 0;
 	FILE* fp;
 
 	if (len < 0 || len > max)
@@ -158,16 +168,24 @@ unsigned char* sq_read_all(const char* path, long max, long* size)
 	if (!fp)
 		return NULL;
 	data = (unsigned char*)malloc(len ? len : 1);
-	if (data && (long)fread(data, 1, len, fp) != len) {
-		free(data);
-		data = NULL;
+	/* In 16 KB steps, so a save read from the slot (128 KB at about
+	 * 1 MB/s) still shows progress */
+	while (data && got < len) {
+		size_t want = len - got < 16384 ? (size_t)(len - got) : 16384;
+		if (fread(data + got, 1, want, fp) != want) {
+			free(data);
+			data = NULL;
+			break;
+		}
+		got += want;
+		if (progress)
+			progress(base + got, ctx);
 	}
 	fclose(fp);
 	if (data)
 		*size = len;
 	return data;
 }
-
 int sq_write_atomic(const char* path, const void* data, long size, struct sq_error* e)
 {
 	char tmp[SQ_PATH_LEN];

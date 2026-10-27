@@ -13,8 +13,8 @@
  * ROM to SQ_ROM_DIR (the "cache"), keeps the live save there as
  * <name>.srm, and backs up cartridge saves in
  * SQ_SAVES_DIR/<name>/NNN-<kind>.sav. The one exception is Cartridge
- * Tools' "Write a save to the cartridge", asked for explicitly
- * (sq_write_cart_save).
+ * Tools' "Write a save/game to the cartridge", asked for explicitly
+ * (sq_write_cart_save, sq_write_cart_rom).
  *
  * All paths go through sq_path(), which prefixes $SQ_ROOT when it is set, so
  * tests can run against a sandbox. Functions report failures in a struct
@@ -74,10 +74,14 @@ struct sq_meter {
 	long first_bytes;
 };
 void sq_meter_start(struct sq_meter* m, long total);
-/* size: "8.0 of 16.0 MB"; rate: "1.0 MB/s, about 8 s left", "Measuring
+/* size: "8.0 of 16.0 MB" ("64 of 128 KB" under 1 MB); rate: "1.0 MB/s, about 8 s left", "Measuring
  * speed..." or "Done". ASCII only (the tools core's font has nothing else). */
 void sq_meter_text(struct sq_meter* m, long done, unsigned long now_ms, int finished,
 	char* size, size_t size_len, char* rate, size_t rate_len);
+
+/* Progress callback: bytes done so far. Each action says what it counts
+ * up to (its total), so the screen can show a meter. */
+typedef void (*sq_progress_fn)(long done, void* ctx);
 
 /* --- small file helpers ------------------------------------------------- */
 
@@ -86,6 +90,9 @@ long sq_file_size(const char* path);			/* -1 when missing */
 void sq_mkdirs(const char* path);			/* mkdir -p */
 /* Read a whole file of at most max bytes; NULL on failure. Free the result. */
 unsigned char* sq_read_all(const char* path, long max, long* size);
+/* Same, reporting base + bytes read so far to progress (may be NULL) */
+unsigned char* sq_read_all_progress(const char* path, long max, long* size,
+	sq_progress_fn progress, void* ctx, long base);
 /* Write via path.tmp + fsync + rename, so a power cut leaves old or new */
 int sq_write_atomic(const char* path, const void* data, long size, struct sq_error* e);
 /* True when the file holds exactly data */
@@ -144,9 +151,6 @@ void sq_rom_header(const char* path, char title[17], char code[5]);
 /* True when SQ_ROM_DIR already holds a verified copy of this cartridge */
 int sq_cache_valid(const struct sq_cart* c);
 
-/* Progress callback: total bytes done so far */
-typedef void (*sq_progress_fn)(long done, void* ctx);
-
 /*
  * Copy src to dst through dst.part (renamed only when complete), reading and
  * writing in parallel threads with large buffers. When crc is not NULL the
@@ -159,19 +163,32 @@ int sq_file_crc(const char* path, uint32_t* crc, sq_progress_fn progress,
 	void* ctx, struct sq_error* e);
 
 /*
- * Copy the cartridge's ROM into the cache, checked against its .crc. A bad
- * read is retried once; if it still doesn't match (common with repros) the
- * copy is kept so the game runs, but without a cached .crc, so it is read
- * again next time. *verified tells which. Returns 0 when a copy exists.
+ * How far a copy of the cartridge can be trusted (*verified below):
+ *   SQ_VERIFIED_CRC    its checksum matches the one the slot gives (.crc)
+ *   SQ_VERIFIED_TWICE  it doesn't, but two reads gave identical data. Dirty
+ *                      contacts make reads differ; a mismatch that repeats
+ *                      exactly is the slot's checksum disagreeing (it does
+ *                      for some genuine cartridges), not a bad read.
+ *   SQ_UNVERIFIED      neither (kept so the game runs, read again next time)
+ * Mismatches are logged to launcher.log with both checksums.
+ */
+enum { SQ_UNVERIFIED, SQ_VERIFIED_CRC, SQ_VERIFIED_TWICE };
+
+/*
+ * Copy the cartridge's ROM into the cache, checked against its .crc. A
+ * mismatch is read again (see SQ_VERIFIED_TWICE); an unverified copy is
+ * kept so the game runs, but without a cached .crc, so it is read again
+ * next time. Returns 0 when a copy exists.
  */
 int sq_cache_cartridge(const struct sq_cart* c, int* verified,
 	sq_progress_fn progress, void* ctx, struct sq_error* e);
 
 /*
  * Copy the cartridge into the library: SQ_ROMS_DIR/<sysdir>/<name>, with its
- * save as <name>.srm next to it. A game already there (same CRC) isn't
+ * save as <name>.srm next to it. A game already there (same data) isn't
  * copied again (*already set); a different game with the same name becomes
- * "<name> (2)". out receives the library path. Returns 0 on success.
+ * "<name> (2)". *verified as for sq_cache_cartridge. out receives the
+ * library path. Returns 0 on success.
  */
 int sq_dump_to_library(const struct sq_cart* c, char* out, size_t len,
 	int* already, int* verified, int* save_copied,
@@ -201,22 +218,26 @@ struct sq_backup {
  * (then *existed = 1). Returns the backup's number, or -1. */
 int sq_backup_store(const char* game, const void* data, long size,
 	const char* kind, int* existed, struct sq_error* e);
-/* Back up the cartridge's own save (if it has one); same return */
-int sq_backup_cart_save(const struct sq_cart* c, int* existed, struct sq_error* e);
+/* Back up the cartridge's own save (if it has one); same return. Reading
+ * it is reported to progress as base + bytes read (up to c->save_size). */
+int sq_backup_cart_save(const struct sq_cart* c, int* existed,
+	sq_progress_fn progress, void* ctx, long base, struct sq_error* e);
 /* List a game's backups, newest first; returns how many (at most max) */
 int sq_backup_list(const char* game, struct sq_backup* out, int max);
 /* Make the file at path the cartridge game's live save, backing up the
- * current one first. Returns 0 on success. */
-int sq_restore_save(const struct sq_cart* c, const char* path, struct sq_error* e);
+ * current one first. Reading it is reported to progress (up to its size).
+ * Returns 0 on success. */
+int sq_restore_save(const struct sq_cart* c, const char* path,
+	sq_progress_fn progress, void* ctx, struct sq_error* e);
 
-/* --- writing a save to the cartridge ------------------------------------- */
+/* --- writing to the cartridge -------------------------------------------- */
 
 /*
- * Only for Cartridge Tools' "Write a save to the cartridge", which the user
- * asks for and confirms. The cartridge is mounted read-only; the caller
- * opens it for writing (cart-event write-enable) just before and closes it
- * again (write-disable) right after, and backs up the cartridge's save
- * first.
+ * Only for "Write a save to the cartridge" and "Write a game to the
+ * cartridge", which the user asks for and confirms. The cartridge is
+ * mounted read-only; the caller opens it for writing (cart-event
+ * write-enable) just before and closes it again (write-disable) right
+ * after, and backs up the cartridge's save first (see sq_do_write_*).
  */
 
 /* Whether the reader accepts writes, as its drive reported when it was
@@ -228,10 +249,25 @@ int sq_reader_writable(void);
  * truncation, no new file, so the drive's FAT and directory don't change
  * (the reader maps the file's sectors to the save chip). Then read it back
  * past the page cache and compare. Refuses a save of another size than the
- * cartridge's. Returns 0 when written and read back identical.
+ * cartridge's. Progress: base + bytes written, then read back (2 x size).
+ * Returns 0 when written and read back identical.
  */
 int sq_write_cart_save(const struct sq_cart* c, const void* data, long size,
-	struct sq_error* e);
+	sq_progress_fn progress, void* ctx, long base, struct sq_error* e);
+
+/*
+ * A game for the cartridge: only for a rewritable (flash) cartridge, which
+ * an original one isn't, and only if the slot passes the writes on. What
+ * can be checked beforehand: a .gba for a Game Boy Advance cartridge, a
+ * .gb/.gbc for a Game Boy one, no bigger than the cartridge's game (the
+ * file on the drive can't grow). 0 when it fits, else why not in e.
+ */
+int sq_cart_rom_fits(const struct sq_cart* c, const char* path, struct sq_error* e);
+/* Write the game at path over the start of the cartridge's game file, in
+ * place like a save, then read it back and compare. Progress: base + bytes
+ * written, then read back (2 x the game's size). 0 when identical. */
+int sq_write_cart_rom(const struct sq_cart* c, const char* path,
+	sq_progress_fn progress, void* ctx, long base, struct sq_error* e);
 
 /*
  * Did it really reach the cartridge? A slot can take a write, and even read
@@ -246,6 +282,9 @@ int sq_write_cart_save(const struct sq_cart* c, const void* data, long size,
  */
 struct sq_result;	/* see "cartridge actions" below */
 void sq_write_check_remember(const struct sq_cart* c, const void* data, long size);
+/* The same for a game written to it (the start of the game is compared,
+ * whatever name the cartridge comes back under) */
+void sq_write_check_remember_rom(const struct sq_cart* c, const char* path);
 int sq_write_check(const struct sq_cart* c, struct sq_result* r);
 
 /* --- save checks -------------------------------------------------------- */
@@ -327,6 +366,30 @@ int sq_is_favorite(const char* path);
  * in the label replaced by _ */
 char* sq_boxart_path(const struct sq_game* g, char* out, size_t len);
 
+/* A save on the SD card: a game's live save (<game>.srm next to it in
+ * roms/, or a cartridge's in SQ_ROM_DIR) or a backup in SQ_SAVES_DIR */
+struct sq_save_file {
+	char path[SQ_PATH_LEN];	/* on the console: /userdata/... */
+	char label[128];	/* the game */
+	char kind[48];		/* "Game Boy Advance save", "Cartridge save",
+				 * "Backup #2 (cartridge)" */
+	long size;
+	long mtime;
+	int live;		/* the save a game plays with */
+	int backup;		/* a backup's number, else 0 */
+};
+/* Every save, by game (ignoring case), the live save before its backups,
+ * newest backup first. *out is malloc'ed; returns how many. */
+int sq_saves_scan(struct sq_save_file** out);
+
+/* Delete a game: a .gba/.gbc/.gb/.zip in SQ_ROMS_DIR, or a cartridge copy in
+ * SQ_ROM_DIR (with its .crc). Its saves are kept. Anything else is
+ * refused. path as on the console. 0 on success. */
+int sq_delete_game(const char* path, struct sq_error* e);
+/* Delete a save: a .srm in SQ_ROMS_DIR or SQ_ROM_DIR, or a backup .sav in
+ * SQ_SAVES_DIR. Anything else is refused. 0 on success. */
+int sq_delete_save(const char* path, struct sq_error* e);
+
 /* --- cartridge actions (Cartridge Tools and the home screen) ------------- */
 
 /* What an action did, for the screen: a few short lines (the first one is
@@ -350,14 +413,26 @@ struct sq_save_choice {
 int sq_save_choices(const struct sq_cart* c, int for_writing,
 	struct sq_save_choice* out, int max);
 
+/*
+ * The actions report progress so the screens can show a meter; each counts
+ * up to (its total):
+ *   copy to library   c->rom_size
+ *   backup save       c->save_size
+ *   restore save      the size of the save at path
+ *   write save        3 x c->save_size (backup, write, read back)
+ *   write game        c->save_size + 2 x the game's size
+ */
+
 /* Copy cartridge to SD card (roms/<system>/, with its save). *added tells
  * whether a new game landed in the library (playlists need a refresh). */
 void sq_do_copy_to_library(const struct sq_cart* c, sq_progress_fn progress,
 	void* ctx, int* added, struct sq_result* r);
 /* Back up the cartridge's save into saves/<game>/ */
-void sq_do_backup_save(const struct sq_cart* c, struct sq_result* r);
+void sq_do_backup_save(const struct sq_cart* c, sq_progress_fn progress, void* ctx,
+	struct sq_result* r);
 /* Make the save at path the one played with (the current one is backed up) */
-void sq_do_restore_save(const struct sq_cart* c, const char* path, struct sq_result* r);
+void sq_do_restore_save(const struct sq_cart* c, const char* path,
+	sq_progress_fn progress, void* ctx, struct sq_result* r);
 /*
  * Experimental: write the save at path onto the cartridge. Checks first
  * (reader write protection, size, Gen 3 sanity), backs up the cartridge's
@@ -365,7 +440,12 @@ void sq_do_restore_save(const struct sq_cart* c, const char* path, struct sq_res
  * "<rw_cmd> write-disable". Every step is logged with sq_log_sd.
  */
 void sq_do_write_save(const struct sq_cart* c, const char* path, const char* rw_cmd,
-	struct sq_result* r);
+	sq_progress_fn progress, void* ctx, struct sq_result* r);
+/* Experimental: write the game at path onto a rewritable cartridge, the
+ * same way (sq_cart_rom_fits, save backup, write-enable, sq_write_cart_rom,
+ * write-disable) */
+void sq_do_write_rom(const struct sq_cart* c, const char* path, const char* rw_cmd,
+	sq_progress_fn progress, void* ctx, struct sq_result* r);
 
 #ifdef __cplusplus
 }

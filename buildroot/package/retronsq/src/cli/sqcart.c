@@ -136,7 +136,7 @@ static int cmd_backup_save(void)
 
 	if (!need_cart(&c))
 		return 1;
-	n = sq_backup_cart_save(&c, &existed, &e);
+	n = sq_backup_cart_save(&c, &existed, NULL, NULL, 0, &e);
 	if (n < 0)
 		return 1;
 	printf("BACKUP=%d\nNEW=%d\n", n, n > 0 && !existed);

@@ -123,7 +123,8 @@ int sq_backup_store(const char* game, const void* data, long size,
 	return sq_write_atomic(path, data, size, e) == 0 ? n : -1;
 }
 
-int sq_backup_cart_save(const struct sq_cart* c, int* existed, struct sq_error* e)
+int sq_backup_cart_save(const struct sq_cart* c, int* existed,
+	sq_progress_fn progress, void* ctx, long base, struct sq_error* e)
 {
 	char path[SQ_PATH_LEN];
 	unsigned char* data;
@@ -134,7 +135,7 @@ int sq_backup_cart_save(const struct sq_cart* c, int* existed, struct sq_error* 
 	if (c->save_size <= 0)
 		return 0;
 	sq_cart_reader_path(c, ".sav", path, sizeof(path));
-	data = sq_read_all(path, SQ_MAX_SAVE, &size);
+	data = sq_read_all_progress(path, SQ_MAX_SAVE, &size, progress, ctx, base);
 	if (!data) {
 		sq_fail(e, errno, "reading the cartridge's save");
 		return -1;
@@ -174,14 +175,15 @@ int sq_backup_list(const char* game, struct sq_backup* out, int max)
 	return count;
 }
 
-int sq_restore_save(const struct sq_cart* c, const char* path, struct sq_error* e)
+int sq_restore_save(const struct sq_cart* c, const char* path,
+	sq_progress_fn progress, void* ctx, struct sq_error* e)
 {
 	char live[SQ_PATH_LEN], dir[SQ_PATH_LEN];
 	unsigned char *data, *cur;
 	long size, cur_size;
 	int existed, rc = -1;
 
-	data = sq_read_all(path, SQ_MAX_SAVE, &size);
+	data = sq_read_all_progress(path, SQ_MAX_SAVE, &size, progress, ctx, 0);
 	if (!data) {
 		sq_fail(e, errno, "reading %s", path);
 		return -1;

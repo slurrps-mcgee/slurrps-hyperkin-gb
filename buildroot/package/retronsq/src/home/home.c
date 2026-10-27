@@ -9,12 +9,15 @@
  *   | Favorites        |   Golden Sun                 |  title     |
  *   | Game Boy Advance |   ...                        |  system    |
  *   | ...              |                              |            |
+ *   | Saves            |                              |            |
  *   | Settings         |                              |            |
- *   | A Play   Y Favorite   B Back                                  |
+ *   | A Play   Y Favorite   SELECT Options   B Back                 |
  *   +--------------------------------------------------------------+
  *
  * Left: pages. Right: the page. Up/Down move, A/Right go in, B/Left go
- * back, Y marks a favorite, L/R jump a screenful.
+ * back, Y marks a favorite, Select opens a game's or save's options
+ * (delete...), L/R jump a screenful. The top right says when a cartridge
+ * is being read, then its name.
  *
  * Starting something never happens here: the choice is written to
  * $RUN/home-request (ACTION=game|cart|retroarch|reboot|poweroff, ROM=,
@@ -37,6 +40,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/statvfs.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "home.h"
@@ -71,24 +75,29 @@
 /* --- pages ------------------------------------------------------------------ */
 
 enum page { PAGE_CART, PAGE_RECENT, PAGE_FAVORITES, PAGE_GBA, PAGE_GBC, PAGE_GB,
-	PAGE_DUMPS, PAGE_SETTINGS, PAGE_COUNT };
+	PAGE_SAVES, PAGE_DUMPS, PAGE_SETTINGS, PAGE_COUNT };
 static const char* page_name[PAGE_COUNT] = {
 	"Cartridge", "Recently played", "Favorites", "Game Boy Advance",
-	"Game Boy Color", "Game Boy", "Cartridge dumps", "Settings"
+	"Game Boy Color", "Game Boy", "Saves", "Cartridge dumps", "Settings"
 };
 
-enum cart_item { CART_PLAY, CART_COPY, CART_BACKUP, CART_RESTORE, CART_WRITE, CART_COUNT };
+enum cart_item { CART_PLAY, CART_COPY, CART_BACKUP, CART_RESTORE, CART_WRITE, CART_WRITE_ROM,
+	CART_COUNT };
 static const char* cart_label[CART_COUNT] = {
 	"Play cartridge", "Copy cartridge to SD card", "Back up cartridge save",
-	"Restore a save...", "Write a save to the cartridge..."
+	"Restore a save...", "Write a save to the cartridge...", "Write a game to the cartridge..."
 };
 static const char* cart_help[CART_COUNT] = {
 	"Start the game from the cartridge.",
 	"Put the game in roms/ to play it without the cartridge.",
 	"Copy the cartridge's save into saves/ on the SD card.",
 	"Choose which save to use with this cartridge.",
-	"Experimental: put a save onto the cartridge itself."
+	"Experimental: put a save onto the cartridge itself.",
+	"Experimental: put a game from roms/ on a rewritable cartridge."
 };
+
+/* A game's or save's options (Select) */
+enum option { OPT_PLAY, OPT_FAVORITE, OPT_DELETE_GAME, OPT_DELETE_SAVE, OPT_CANCEL };
 
 enum setting { SET_AUTOLOAD, SET_WAIT, SET_GBA, SET_GBC, SET_GB, SET_UI, SET_RETROARCH,
 	SET_ABOUT, SET_RESTART, SET_POWEROFF, SET_COUNT };
@@ -116,6 +125,13 @@ static char version[64] = "";
 static struct sq_cart cart;
 static unsigned cart_generation;
 static int cart_present;
+static int cart_reading;	/* the slot is reading a cartridge (not mounted yet) */
+static int cart_writable = -1;	/* sq_reader_writable(): 1, 0 (write protected), -1 */
+static char cart_crc[16];	/* the slot's checksum, as shown */
+
+/* The Saves page */
+static struct sq_save_file* saves;
+static int save_count;
 
 /* Settings values as shown, and the emulator cores to cycle through */
 static char values[SET_COUNT][32];
@@ -127,19 +143,24 @@ static char art_path[SQ_PATH_LEN];
 static Uint32 art_due;
 
 /* Dialogs over the page */
-enum dialog { DLG_NONE, DLG_CHOOSE_SAVE, DLG_CONFIRM, DLG_BUSY, DLG_RESULT, DLG_INFO };
+enum dialog { DLG_NONE, DLG_CHOOSE_SAVE, DLG_CHOOSE_ROM, DLG_OPTIONS, DLG_CONFIRM, DLG_BUSY,
+	DLG_RESULT, DLG_INFO };
 static enum dialog dialog;
 static int dlg_sel;
 static struct sq_save_choice choices[65];
 static int choice_count, choice_writing;
-enum confirm_what { CONFIRM_RESTORE, CONFIRM_WRITE, CONFIRM_RESTART, CONFIRM_POWEROFF };
+static struct sq_game* rom_choices;	/* games that fit the cartridge */
+static int rom_choice_count;
+static int options[5], option_count;	/* enum option, for the selected item */
+enum confirm_what { CONFIRM_RESTORE, CONFIRM_WRITE, CONFIRM_WRITE_ROM, CONFIRM_DELETE_GAME,
+	CONFIRM_DELETE_SAVE, CONFIRM_RESTART, CONFIRM_POWEROFF };
 static enum confirm_what confirm_what;
 static int confirm_step;
 static int dlg_button;		/* confirm: 0 = No (the default), 1 = Yes */
 static char info[6][64];		/* DLG_INFO lines */
 
 /* The worker thread (cartridge actions) */
-enum task { TASK_COPY, TASK_BACKUP, TASK_RESTORE, TASK_WRITE };
+enum task { TASK_COPY, TASK_BACKUP, TASK_RESTORE, TASK_WRITE, TASK_WRITE_ROM };
 static pthread_t worker;
 static volatile int worker_busy;
 static volatile long work_done, work_total;
@@ -152,9 +173,10 @@ static int task_added;
 
 /* --- small helpers ------------------------------------------------------------ */
 
+/* The pages that list games */
 static int is_list_page(int p)
 {
-	return p >= PAGE_RECENT && p <= PAGE_DUMPS;
+	return (p >= PAGE_RECENT && p <= PAGE_GB) || p == PAGE_DUMPS;
 }
 
 static int item_count(void)
@@ -163,16 +185,31 @@ static int item_count(void)
 		return cart.present ? CART_COUNT : 0;
 	if (page == PAGE_SETTINGS)
 		return SET_COUNT;
+	if (page == PAGE_SAVES)
+		return save_count;
 	return game_count;
 }
 
+/* Writing needs a slot that isn't write protected, and a save a save */
 static int cart_item_enabled(int i)
 {
 	if (!cart.present)
 		return 0;
+	if ((i == CART_WRITE || i == CART_WRITE_ROM) && cart_writable == 0)
+		return 0;
 	if (i == CART_BACKUP || i == CART_WRITE)
 		return cart.save_size > 0;
 	return 1;
+}
+
+/* Why an item is greyed out, else its help */
+static const char* cart_item_help(int i)
+{
+	if (cart_item_enabled(i))
+		return cart_help[i];
+	if ((i == CART_WRITE || i == CART_WRITE_ROM) && cart_writable == 0)
+		return "Not available: the slot reports write protection.";
+	return "Not available: this cartridge has no save.";
 }
 
 /* Hand something over to sq-session and leave */
@@ -324,6 +361,9 @@ static void free_games(void)
 	free(games);
 	games = NULL;
 	game_count = 0;
+	free(saves);
+	saves = NULL;
+	save_count = 0;
 }
 
 static void load_page(void)
@@ -345,6 +385,11 @@ static void load_page(void)
 			for (p = games[i].label; *p; p++)
 				if (*p == '_')
 					*p = ' ';
+		break;
+	case PAGE_SAVES:
+		save_count = sq_saves_scan(&saves);
+		if (save_count < 0)
+			save_count = 0;
 		break;
 	case PAGE_SETTINGS:
 		load_cores();
@@ -379,16 +424,49 @@ static void scroll(void)
 	art_due = SDL_GetTicks() + ART_DELAY_MS;
 }
 
+/* Reload the page, keeping the selection where it was (after a delete) */
+static void reload_page(void)
+{
+	int keep = sel, inside = in_page;
+	load_page();
+	sel = keep;
+	in_page = inside && item_count() > 0;
+	scroll();
+}
+
+/* Read what is shown about a new cartridge once, not on every redraw */
+static void cart_changed(void)
+{
+	char path[SQ_PATH_LEN];
+	uint32_t crc;
+	sq_cart_reader_path(&cart, ".crc", path, sizeof(path));
+	if (cart.present && sq_crc_read_file(path, &crc) == 0)
+		snprintf(cart_crc, sizeof(cart_crc), "%08X", (unsigned)crc);
+	else
+		snprintf(cart_crc, sizeof(cart_crc), "None given");
+}
+
 static void poll_cartridge(void)
 {
 	struct sq_cart c;
+	int reading, writable;
+
 	sq_cart_scan(&c);
+	/* Seen by the slot but not mounted yet: it is being read */
+	reading = !c.present && sq_reader_state() == SQ_READER_PENDING;
+	writable = sq_reader_writable();
+	if (reading != cart_reading || writable != cart_writable) {
+		cart_reading = reading;
+		cart_writable = writable;
+		dirty = 1;
+	}
 	if (c.present != cart_present || (c.present && (c.generation != cart_generation ||
 			strcmp(c.rom, cart.rom)))) {
 		struct sq_result r;
 		cart = c;
 		cart_present = c.present;
 		cart_generation = c.generation;
+		cart_changed();
 		/* A save was written to this cartridge: now it's back in, say
 		 * whether it really is on it */
 		if (cart.present && sq_write_check(&cart, &r)) {
@@ -421,14 +499,18 @@ static void* worker_main(void* arg)
 		sq_do_copy_to_library(&cart, progress, NULL, &task_added, &task_result);
 		break;
 	case TASK_BACKUP:
-		sq_do_backup_save(&cart, &task_result);
+		sq_do_backup_save(&cart, progress, NULL, &task_result);
 		break;
 	case TASK_RESTORE:
-		sq_do_restore_save(&cart, task_path, &task_result);
+		sq_do_restore_save(&cart, task_path, progress, NULL, &task_result);
 		break;
 	case TASK_WRITE:
 		snprintf(rw, sizeof(rw), "'%s'", sq_path(path, sizeof(path), CART_EVENT));
-		sq_do_write_save(&cart, task_path, rw, &task_result);
+		sq_do_write_save(&cart, task_path, rw, progress, NULL, &task_result);
+		break;
+	case TASK_WRITE_ROM:
+		snprintf(rw, sizeof(rw), "'%s'", sq_path(path, sizeof(path), CART_EVENT));
+		sq_do_write_rom(&cart, task_path, rw, progress, NULL, &task_result);
 		break;
 	}
 	worker_busy = 0;
@@ -452,8 +534,18 @@ static void start_task(enum task t, const char* title, const char* path)
 	snprintf(work_title, sizeof(work_title), "%s", title);
 	snprintf(task_path, sizeof(task_path), "%s", path ? path : "");
 	work_done = 0;
-	work_total = t == TASK_COPY ? cart.rom_size : 0;
+	/* What each action counts up to (see sqcart.h), for the meter */
+	switch (t) {
+	case TASK_COPY: work_total = cart.rom_size; break;
+	case TASK_BACKUP: work_total = cart.save_size; break;
+	case TASK_RESTORE: work_total = sq_file_size(task_path); break;
+	case TASK_WRITE: work_total = 3 * cart.save_size; break;
+	case TASK_WRITE_ROM: work_total = cart.save_size + 2 * sq_file_size(task_path); break;
+	}
+	if (work_total < 0)
+		work_total = 0;
 	sq_meter_start(&meter, work_total);
+	memset(&task_result, 0, sizeof(task_result));
 	task_added = 0;
 	worker_busy = 1;
 	dialog = DLG_BUSY;
@@ -486,6 +578,61 @@ static void show_about(void)
 
 /* --- input ------------------------------------------------------------------------ */
 
+/* The games in roms/ that can be written to this cartridge */
+static void list_rom_choices(void)
+{
+	char full[SQ_PATH_LEN];
+	int i, n;
+
+	free(rom_choices);
+	rom_choices = NULL;
+	rom_choice_count = 0;
+	n = sq_library_scan(SQ_ROMS_DIR, NULL, &rom_choices);
+	for (i = 0; i < n; i++)
+		if (sq_cart_rom_fits(&cart, sq_path(full, sizeof(full), rom_choices[i].path), NULL) == 0)
+			rom_choices[rom_choice_count++] = rom_choices[i];
+}
+
+/* Select on a game or a save: what can be done with it */
+static void open_options(void)
+{
+	if (item_count() == 0)
+		return;
+	option_count = 0;
+	if (page == PAGE_SAVES) {
+		options[option_count++] = OPT_DELETE_SAVE;
+	} else {
+		options[option_count++] = OPT_PLAY;
+		options[option_count++] = OPT_FAVORITE;
+		options[option_count++] = OPT_DELETE_GAME;
+	}
+	options[option_count++] = OPT_CANCEL;
+	dlg_sel = 0;
+	dialog = DLG_OPTIONS;
+}
+
+static void ask(enum confirm_what what)
+{
+	confirm_what = what;
+	confirm_step = 0;
+	dlg_button = 0;
+	dialog = DLG_CONFIRM;
+}
+
+/* Show how a delete went, and the page without it */
+static void deleted(int ok, const char* done, const char* failed, const char* name,
+	const struct sq_error* e, const char* note)
+{
+	memset(&task_result, 0, sizeof(task_result));
+	task_result.ok = ok;
+	snprintf(task_result.line[0], sizeof(task_result.line[0]), "%s", ok ? done : failed);
+	snprintf(task_result.line[1], sizeof(task_result.line[1]), "%s", ok ? name : e->msg);
+	if (ok && note)
+		snprintf(task_result.line[2], sizeof(task_result.line[2]), "%s", note);
+	dialog = DLG_RESULT;
+	reload_page();
+}
+
 static void activate(void)
 {
 	if (page == PAGE_CART) {
@@ -502,7 +649,16 @@ static void activate(void)
 			dlg_sel = 0;
 			dialog = DLG_CHOOSE_SAVE;
 			break;
+		case CART_WRITE_ROM:
+			list_rom_choices();
+			dlg_sel = 0;
+			dialog = DLG_CHOOSE_ROM;
+			break;
 		}
+		return;
+	}
+	if (page == PAGE_SAVES) {
+		open_options();
 		return;
 	}
 	if (page == PAGE_SETTINGS) {
@@ -524,9 +680,92 @@ static void activate(void)
 		request("game", &games[sel]);
 }
 
+/* An option picked from the options menu */
+static void do_option(int o)
+{
+	dialog = DLG_NONE;
+	switch (o) {
+	case OPT_PLAY:
+		request("game", &games[sel]);
+		break;
+	case OPT_FAVORITE:
+		sq_favorite_toggle(games[sel].path, games[sel].label);
+		if (page == PAGE_FAVORITES)
+			reload_page();
+		break;
+	case OPT_DELETE_GAME:
+		ask(CONFIRM_DELETE_GAME);
+		break;
+	case OPT_DELETE_SAVE:
+		ask(CONFIRM_DELETE_SAVE);
+		break;
+	default:
+		break;
+	}
+}
+
+/* Yes, after the confirmation(s) */
+static void confirmed(void)
+{
+	char full[SQ_PATH_LEN];
+	struct sq_error e = { "", 0 };
+	int ok;
+
+	switch (confirm_what) {
+	case CONFIRM_RESTORE:
+		start_task(TASK_RESTORE, "Restoring the save...", choices[dlg_sel].path);
+		break;
+	case CONFIRM_WRITE:
+		start_task(TASK_WRITE, "Writing the save to the cartridge...", choices[dlg_sel].path);
+		break;
+	case CONFIRM_WRITE_ROM:
+		start_task(TASK_WRITE_ROM, "Writing the game to the cartridge...",
+			sq_path(full, sizeof(full), rom_choices[dlg_sel].path));
+		break;
+	case CONFIRM_DELETE_GAME:
+		ok = sq_delete_game(games[sel].path, &e) == 0;
+		deleted(ok, "Game deleted.", "Couldn't delete the game:", games[sel].label, &e,
+			"Its saves are kept (see Saves).");
+		break;
+	case CONFIRM_DELETE_SAVE:
+		ok = sq_delete_save(saves[sel].path, &e) == 0;
+		deleted(ok, "Save deleted.", "Couldn't delete the save:", saves[sel].label, &e, NULL);
+		break;
+	case CONFIRM_RESTART: request("reboot", NULL); break;
+	case CONFIRM_POWEROFF: request("poweroff", NULL); break;
+	}
+}
+
+/* Changing the cartridge or losing a game's progress: asked twice */
+static int asks_twice(void)
+{
+	return confirm_what == CONFIRM_WRITE || confirm_what == CONFIRM_WRITE_ROM ||
+		(confirm_what == CONFIRM_DELETE_SAVE && saves[sel].live);
+}
+
 static void handle_dialog(int b)
 {
 	switch (dialog) {
+	case DLG_CHOOSE_ROM:
+		if (b == BTN_B || (b == BTN_A && rom_choice_count == 0))
+			dialog = DLG_NONE;
+		else if (b == BTN_UP && dlg_sel > 0)
+			dlg_sel--;
+		else if (b == BTN_DOWN && dlg_sel < rom_choice_count - 1)
+			dlg_sel++;
+		else if (b == BTN_A)
+			ask(CONFIRM_WRITE_ROM);
+		break;
+	case DLG_OPTIONS:
+		if (b == BTN_B || b == BTN_SELECT)
+			dialog = DLG_NONE;
+		else if (b == BTN_UP && dlg_sel > 0)
+			dlg_sel--;
+		else if (b == BTN_DOWN && dlg_sel < option_count - 1)
+			dlg_sel++;
+		else if (b == BTN_A)
+			do_option(options[dlg_sel]);
+		break;
 	case DLG_CHOOSE_SAVE:
 		if (b == BTN_B || (b == BTN_A && choice_count == 0))
 			dialog = DLG_NONE;
@@ -534,12 +773,8 @@ static void handle_dialog(int b)
 			dlg_sel--;
 		else if (b == BTN_DOWN && dlg_sel < choice_count - 1)
 			dlg_sel++;
-		else if (b == BTN_A) {
-			confirm_what = choice_writing ? CONFIRM_WRITE : CONFIRM_RESTORE;
-			confirm_step = 0;
-			dlg_button = 0;
-			dialog = DLG_CONFIRM;
-		}
+		else if (b == BTN_A)
+			ask(choice_writing ? CONFIRM_WRITE : CONFIRM_RESTORE);
 		break;
 	case DLG_CONFIRM:
 		/* Two buttons, No and Yes: Left/Right (or Up/Down) pick, A presses
@@ -547,22 +782,13 @@ static void handle_dialog(int b)
 		if (b == BTN_LEFT || b == BTN_RIGHT || b == BTN_UP || b == BTN_DOWN)
 			dlg_button = !dlg_button;
 		else if (b == BTN_B || (b == BTN_A && dlg_button == 0))
-			dialog = confirm_what <= CONFIRM_WRITE ? DLG_CHOOSE_SAVE : DLG_NONE;
-		else if (b == BTN_A && confirm_what == CONFIRM_WRITE && confirm_step == 0) {
-			confirm_step = 1;	/* changing a cartridge: ask twice */
+			dialog = confirm_what <= CONFIRM_WRITE ? DLG_CHOOSE_SAVE
+				: confirm_what == CONFIRM_WRITE_ROM ? DLG_CHOOSE_ROM : DLG_NONE;
+		else if (b == BTN_A && asks_twice() && confirm_step == 0) {
+			confirm_step = 1;
 			dlg_button = 0;
 		} else if (b == BTN_A) {
-			switch (confirm_what) {
-			case CONFIRM_RESTORE:
-				start_task(TASK_RESTORE, "Restoring the save...", choices[dlg_sel].path);
-				break;
-			case CONFIRM_WRITE:
-				start_task(TASK_WRITE, "Writing the save to the cartridge...",
-					choices[dlg_sel].path);
-				break;
-			case CONFIRM_RESTART: request("reboot", NULL); break;
-			case CONFIRM_POWEROFF: request("poweroff", NULL); break;
-			}
+			confirmed();
 		}
 		break;
 	case DLG_RESULT:
@@ -625,6 +851,10 @@ static void handle_button(int b)
 	case BTN_START:
 		activate();
 		break;
+	case BTN_SELECT:
+		if (is_list_page(page) || page == PAGE_SAVES)
+			open_options();
+		break;
 	case BTN_Y:
 		if (is_list_page(page) && n > 0) {
 			sq_favorite_toggle(games[sel].path, games[sel].label);
@@ -670,6 +900,14 @@ static void draw_header(void)
 		snprintf(text, sizeof(text), "Cartridge: %s", cart_name());
 		ui_text_right(FONT_SMALL, UI_W - 60 - ui_text_width(FONT_SMALL, version), 20,
 			COL_ACCENT, text);
+	} else if (cart_reading) {
+		/* Dots that count up while the slot reads it (redrawn by main) */
+		static const char* dots[4] = { "", ".", "..", "..." };
+		int x = UI_W - 60 - ui_text_width(FONT_SMALL, version);
+		snprintf(text, sizeof(text), "Reading cartridge%s", dots[(SDL_GetTicks() / 400) % 4]);
+		/* Left-aligned at where "..." ends up, so it doesn't wobble */
+		ui_text(FONT_SMALL, x - ui_text_width(FONT_SMALL, "Reading cartridge..."), 20,
+			COL_ACCENT, text, 0);
 	}
 }
 
@@ -760,37 +998,123 @@ static void draw_games(void)
 	draw_detail(&games[sel]);
 }
 
+/* "128 KB flash": a save's size and, on a GBA cartridge, its chip */
+static void save_text(long size, char* out, size_t len)
+{
+	const char* chip = "";
+	if (size <= 0) {
+		snprintf(out, len, "None");
+		return;
+	}
+	if (!strcmp(cart.sysdir, "gba"))
+		chip = size <= 8192 ? " EEPROM" : size == 32768 ? " SRAM" : " flash";
+	if (size < 1024)
+		snprintf(out, len, "%ld bytes%s", size, chip);
+	else
+		snprintf(out, len, "%ld KB%s", (size + 1023) / 1024, chip);
+}
+
+/* A panel on the right with labelled lines: one label + value per row. A
+ * value starting with "!" is a warning, shown in red without the "!". */
+static void draw_facts(const char* title, const char* const* labels, const char* const* values, int n)
+{
+	int i, y = LIST_Y + 8;
+	ui_rect(ART_X, LIST_Y - 8, ART_W, FOOT_Y - 24 - (LIST_Y - 8), COL_PANEL);
+	ui_rect(ART_X, LIST_Y - 8, ART_W, 4, COL_ACCENT);
+	ui_text(FONT_BOLD, ART_X + 20, y, COL_TEXT, title, ART_W - 40);
+	y += 44;
+	for (i = 0; i < n; i++, y += 50) {
+		ui_text(FONT_SMALL, ART_X + 20, y, COL_DIM, labels[i], ART_W - 40);
+		ui_text(FONT_SMALL, ART_X + 20, y + 22, values[i][0] == '!' ? COL_BAD : COL_TEXT,
+			values[i][0] == '!' ? values[i] + 1 : values[i], ART_W - 40);
+	}
+}
+
 static void draw_cart_page(void)
 {
-	char line[96], a[16], b[16];
-	int i, y;
+	char size[24], save[32], a[16];
+	const char* labels[7];
+	const char* values[7];
+	int i, n = 0;
 
 	ui_text(FONT_TITLE, LIST_X, TOP_Y, COL_TEXT, "Cartridge", 0);
 	if (!cart.present) {
+		if (cart_reading) {
+			ui_text(FONT_TEXT, LIST_X, LIST_Y + 8, COL_ACCENT, "Reading the cartridge...", 0);
+			ui_text(FONT_SMALL, LIST_X, LIST_Y + 44, COL_DIM, "It shows up here in a moment.", 0);
+			return;
+		}
 		ui_text(FONT_TEXT, LIST_X, LIST_Y + 8, COL_DIM, "No cartridge inserted.", 0);
 		sq_cfg_get("CART_AUTOLOAD", a, sizeof(a));
 		ui_text(FONT_SMALL, LIST_X, LIST_Y + 44, COL_DIM, strcmp(a, "0")
 			? "Insert one: it starts by itself." : "Insert one: it shows up here.", 0);
 		return;
 	}
-	/* A small card with what the cartridge is */
-	ui_rect(LIST_X, LIST_Y - 8, LIST_W, 96, COL_PANEL);
-	ui_rect(LIST_X, LIST_Y - 8, 6, 96, COL_ACCENT);
-	ui_text(FONT_BOLD, LIST_X + 20, LIST_Y, COL_TEXT, cart_name(), LIST_W - 40);
-	snprintf(a, sizeof(a), "%.1f MB", cart.rom_size / (1024.0 * 1024.0));
-	if (cart.save_size > 0)
-		snprintf(b, sizeof(b), "%ld KB save", (cart.save_size + 1023) / 1024);
-	else
-		snprintf(b, sizeof(b), "no save");
-	snprintf(line, sizeof(line), "%s  \xc2\xb7  %s  \xc2\xb7  %s", cart.system, a, b);
-	ui_text(FONT_SMALL, LIST_X + 20, LIST_Y + 34, COL_DIM, line, LIST_W - 40);
-	ui_text(FONT_SMALL, LIST_X + 20, LIST_Y + 58, COL_DIM, cart.rom, LIST_W - 40);
 
-	y = LIST_Y + 104;
+	/* The actions on the left (greyed out when they can't work)... */
 	for (i = 0; i < CART_COUNT; i++)
-		draw_row(y + i * ROW_H, LIST_W, cart_label[i], NULL, i == sel, cart_item_enabled(i), 0);
+		draw_row(LIST_Y + i * ROW_H, LIST_W, cart_label[i], NULL, i == sel, cart_item_enabled(i), 0);
 	if (in_page)
-		ui_text(FONT_SMALL, LIST_X, y + CART_COUNT * ROW_H + 8, COL_DIM, cart_help[sel], LIST_W);
+		ui_text(FONT_SMALL, LIST_X, LIST_Y + CART_COUNT * ROW_H + 8,
+			cart_item_enabled(sel) ? COL_DIM : COL_ACCENT, cart_item_help(sel), LIST_W);
+
+	/* ...and what the cartridge is on the right */
+	snprintf(size, sizeof(size), "%.1f MB", cart.rom_size / (1024.0 * 1024.0));
+	save_text(cart.save_size, save, sizeof(save));
+	labels[n] = "System"; values[n++] = cart.system;
+	if (cart.code[0]) {
+		labels[n] = "Game code"; values[n++] = cart.code;
+	}
+	labels[n] = "Game size"; values[n++] = size;
+	labels[n] = "Save"; values[n++] = save;
+	labels[n] = "Writable";
+	values[n++] = cart_writable == 1 ? "Yes" : cart_writable == 0
+		? "!No (write protected)" : "Unknown";
+	labels[n] = "Slot checksum"; values[n++] = cart_crc;
+	labels[n] = "File"; values[n++] = cart.rom;
+	draw_facts(cart_name(), labels, values, n);
+}
+
+/* The Saves page: every save, with what it is on the right */
+static void draw_saves(void)
+{
+	char head[32], size[24], when[32];
+	const char* labels[4];
+	const char* values[4];
+	const struct sq_save_file* f;
+	struct tm tm;
+	time_t t;
+	int i;
+
+	ui_text(FONT_TITLE, LIST_X, TOP_Y, COL_TEXT, "Saves", 0);
+	if (save_count == 0) {
+		ui_text(FONT_TEXT, LIST_X, LIST_Y + 8, COL_DIM, "No saves yet.", 0);
+		ui_text(FONT_SMALL, LIST_X, LIST_Y + 44, COL_DIM, "Games save here as you play.", 0);
+		return;
+	}
+	snprintf(head, sizeof(head), "%d save%s", save_count, save_count == 1 ? "" : "s");
+	ui_text_right(FONT_SMALL, LIST_X + LIST_W, TOP_Y + 12, COL_DIM, head);
+	for (i = 0; i < LIST_ROWS && top + i < save_count; i++) {
+		f = &saves[top + i];
+		draw_row(LIST_Y + i * ROW_H, LIST_W, f->label, f->live ? NULL : "backup",
+			top + i == sel, 1, 0);
+	}
+
+	f = &saves[sel];
+	if (f->size < 1024)
+		snprintf(size, sizeof(size), "%ld bytes", f->size);
+	else
+		snprintf(size, sizeof(size), "%ld KB", (f->size + 1023) / 1024);
+	t = (time_t)f->mtime;
+	if (localtime_r(&t, &tm))
+		strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tm);
+	else
+		snprintf(when, sizeof(when), "?");
+	labels[0] = "What"; values[0] = f->kind;
+	labels[1] = "Size"; values[1] = size;
+	labels[2] = "Last saved"; values[2] = when;
+	labels[3] = "File"; values[3] = strrchr(f->path, '/') ? strrchr(f->path, '/') + 1 : f->path;
+	draw_facts(f->label, labels, values, 4);
 }
 
 static void draw_settings(void)
@@ -808,7 +1132,7 @@ static void draw_settings(void)
 static void draw_footer(void)
 {
 	const char* hint;
-	if (dialog == DLG_CHOOSE_SAVE)
+	if (dialog == DLG_CHOOSE_SAVE || dialog == DLG_CHOOSE_ROM || dialog == DLG_OPTIONS)
 		hint = "A  Choose     B  Back";
 	else if (dialog == DLG_CONFIRM)
 		hint = "\xe2\x97\x80 \xe2\x96\xb6  Choose     A  Press     B  No";
@@ -822,8 +1146,10 @@ static void draw_footer(void)
 		hint = setting_key[sel] ? "\xe2\x97\x80 \xe2\x96\xb6  Change     B  Back" : "A  Open     B  Back";
 	else if (page == PAGE_CART)
 		hint = "A  Select     B  Back";
+	else if (page == PAGE_SAVES)
+		hint = "A  Options     L R  Page     B  Back";
 	else
-		hint = "A  Play     Y  Favorite     L R  Page     B  Back";
+		hint = "A  Play     Y  Favorite     SELECT  Options     L R  Page     B  Back";
 	ui_text(FONT_SMALL, 40, FOOT_Y, COL_DIM, hint, 0);
 }
 
@@ -849,34 +1175,111 @@ static void draw_box(const char* title, unsigned title_color, const char* const*
 	}
 }
 
+/* A list to pick from, in a box: label(i) for each row, value(i) (may be
+ * NULL) right-aligned; dlg_sel is the selection. empty1/empty2 when the
+ * list is empty. */
+static void draw_pick(const char* title, int count, const char* (*label)(int),
+	const char* (*value)(int), const char* empty1, const char* empty2)
+{
+	int rows = count < 8 ? count : 8, h = 110 + (count ? rows * ROW_H : 80);
+	int y0 = (UI_H - h) / 2, first = dlg_sel >= rows ? dlg_sel - rows + 1 : 0, i;
+
+	ui_rect(240, y0, 800, h, COL_PANEL);
+	ui_rect(240, y0, 800, 4, COL_ACCENT);
+	ui_text(FONT_BOLD, 272, y0 + 28, COL_TEXT, title, 736);
+	if (count == 0) {
+		ui_text(FONT_TEXT, 272, y0 + 80, COL_DIM, empty1, 736);
+		if (empty2)
+			ui_text(FONT_SMALL, 272, y0 + 116, COL_DIM, empty2, 736);
+		return;
+	}
+	for (i = 0; i < rows; i++) {
+		int row = y0 + 76 + i * ROW_H;
+		if (first + i == dlg_sel) {
+			ui_rect(256, row, 768, ROW_H - 4, COL_ROW);
+			ui_rect(256, row, 4, ROW_H - 4, COL_ACCENT);
+		}
+		ui_text(FONT_TEXT, 276, row + 7, COL_TEXT, label(first + i), value ? 580 : 730);
+		if (value)
+			ui_text_right(FONT_TEXT, 1008, row + 7, COL_DIM, value(first + i));
+	}
+}
+
+static const char* save_choice_label(int i)
+{
+	return choices[i].label;
+}
+
+static const char* rom_choice_label(int i)
+{
+	return rom_choices[i].label;
+}
+
+static const char* rom_choice_size(int i)
+{
+	static char text[16];
+	char full[SQ_PATH_LEN];
+	long size = sq_file_size(sq_path(full, sizeof(full), rom_choices[i].path));
+	if (size < 1048576)
+		snprintf(text, sizeof(text), "%ld KB", (size + 1023) / 1024);
+	else
+		snprintf(text, sizeof(text), "%.1f MB", size / 1048576.0);
+	return text;
+}
+
+static const char* option_label(int i)
+{
+	switch (options[i]) {
+	case OPT_PLAY: return "Play";
+	case OPT_FAVORITE: return sq_is_favorite(games[sel].path) ? "Remove from favorites" : "Add to favorites";
+	case OPT_DELETE_GAME: return "Delete game...";
+	case OPT_DELETE_SAVE: return saves[sel].live ? "Delete save..." : "Delete backup...";
+	default: return "Cancel";
+	}
+}
+
+/* What a longer action is doing now, from how far it got (see the totals
+ * in start_task) */
+static const char* work_phase(void)
+{
+	long done = work_done, save = cart.save_size;
+	long game = task == TASK_WRITE_ROM ? (work_total - save) / 2 : save;
+	if (task != TASK_WRITE && task != TASK_WRITE_ROM)
+		return NULL;
+	if (save > 0 && done < save)
+		return "Backing up the cartridge's save first";
+	if (done < save + game)
+		return task == TASK_WRITE ? "Writing the save" : "Writing the game";
+	return "Reading it back to check it";
+}
+
 static void draw_dialog(void)
 {
 	static const char* const yes_no[2] = { "No", "Yes" };
 	static const char* const no_write[2] = { "No", "Write it" };
+	static const char* const no_delete[2] = { "No", "Delete" };
 	static const char* const ok[1] = { "OK" };
+	char size[64], max[96];
 	const char* lines[6];
-	int i, y, n;
+	const char* phase;
+	int i, n;
 
 	switch (dialog) {
 	case DLG_CHOOSE_SAVE:
-		ui_rect(240, 120, 800, 480, COL_PANEL);
-		ui_rect(240, 120, 800, 4, COL_ACCENT);
-		ui_text(FONT_BOLD, 272, 148, COL_TEXT, choice_writing
-			? "Write which save to the cartridge?" : "Use which save with this cartridge?", 0);
-		if (choice_count == 0) {
-			ui_text(FONT_TEXT, 272, 200, COL_DIM, "No saves found for this game yet.", 0);
-			break;
-		}
-		n = choice_count < 8 ? choice_count : 8;
-		y = dlg_sel >= n ? dlg_sel - n + 1 : 0;
-		for (i = 0; i < n; i++) {
-			int row = 196 + i * ROW_H;
-			if (y + i == dlg_sel) {
-				ui_rect(256, row, 768, ROW_H - 4, COL_ROW);
-				ui_rect(256, row, 4, ROW_H - 4, COL_ACCENT);
-			}
-			ui_text(FONT_TEXT, 276, row + 7, COL_TEXT, choices[y + i].label, 730);
-		}
+		draw_pick(choice_writing ? "Write which save to the cartridge?"
+			: "Use which save with this cartridge?", choice_count, save_choice_label, NULL,
+			"No saves found for this game yet.", NULL);
+		break;
+	case DLG_CHOOSE_ROM:
+		snprintf(max, sizeof(max), "Games in roms/%s (.%s%s) of at most %.1f MB fit.",
+			cart.sysdir, !strcmp(cart.sysdir, "gba") ? "gba" : "gb", !strcmp(cart.sysdir, "gba")
+			? "" : " or .gbc", cart.rom_size / 1048576.0);
+		draw_pick("Write which game to the cartridge?", rom_choice_count, rom_choice_label,
+			rom_choice_size, "No game on the SD card fits this cartridge.", max);
+		break;
+	case DLG_OPTIONS:
+		draw_pick(page == PAGE_SAVES ? saves[sel].label : games[sel].label, option_count,
+			option_label, NULL, "", NULL);
 		break;
 	case DLG_CONFIRM:
 		n = 0;
@@ -894,6 +1297,35 @@ static void draw_dialog(void)
 			draw_box(confirm_step ? "Sure? This changes the cartridge itself."
 				: "Write this save onto the cartridge?", confirm_step ? COL_BAD : COL_ACCENT,
 				lines, n, confirm_step ? no_write : yes_no, 2, dlg_button);
+		} else if (confirm_what == CONFIRM_WRITE_ROM) {
+			snprintf(size, sizeof(size), "%s (%s)", rom_choices[dlg_sel].label,
+				rom_choice_size(dlg_sel));
+			lines[n++] = size;
+			lines[n++] = "It replaces the cartridge's game: copy that to the";
+			lines[n++] = "SD card first to keep it. Its save is backed up.";
+			lines[n++] = "Only rewritable (flash) cartridges can take a game.";
+			lines[n++] = "Don't remove the cartridge until it's done.";
+			draw_box(confirm_step ? "Sure? This replaces the cartridge's game."
+				: "Write this game onto the cartridge?", confirm_step ? COL_BAD : COL_ACCENT,
+				lines, n, confirm_step ? no_write : yes_no, 2, dlg_button);
+		} else if (confirm_what == CONFIRM_DELETE_GAME) {
+			lines[n++] = games[sel].label;
+			lines[n++] = games[sel].path;
+			lines[n++] = "Its saves are kept.";
+			draw_box("Delete this game from the SD card?", COL_ACCENT, lines, n,
+				no_delete, 2, dlg_button);
+		} else if (confirm_what == CONFIRM_DELETE_SAVE) {
+			const struct sq_save_file* f = &saves[sel];
+			lines[n++] = f->label;
+			lines[n++] = f->kind;
+			if (f->live) {
+				lines[n++] = "The game's progress in it is lost.";
+				if (!strncmp(f->path, SQ_ROM_DIR "/", strlen(SQ_ROM_DIR) + 1))
+					lines[n++] = "Next time, the cartridge's own save is used.";
+			}
+			draw_box(confirm_step ? "Sure? This can't be undone."
+				: f->live ? "Delete this save?" : "Delete this backup?",
+				confirm_step ? COL_BAD : COL_ACCENT, lines, n, no_delete, 2, dlg_button);
 		} else {
 			lines[n++] = "Games save as you play; nothing is lost.";
 			draw_box(confirm_what == CONFIRM_RESTART ? "Restart the console?"
@@ -906,9 +1338,9 @@ static void draw_dialog(void)
 		ui_text(FONT_BOLD, 272, 268, COL_TEXT, work_title, 640);
 		ui_rect(272, 324, 736, 20, COL_SIDEBAR);
 		if (work_total > 0) {
-			/* A copy: percent, bar, "MB of MB", speed and time left, the
+			/* Percent, bar, "MB of MB" (or KB), speed and time left, the
 			 * same as the loading screen */
-			char size[48], rate[64], pct[8];
+			char rate[64], pct[8];
 			long done = !worker_busy ? work_total
 				: work_done < work_total ? work_done : work_total;
 			snprintf(pct, sizeof(pct), "%d%%", (int)(100.0 * done / work_total));
@@ -921,7 +1353,10 @@ static void draw_dialog(void)
 		} else {
 			ui_rect(272 + (int)((SDL_GetTicks() / 8) % 656), 324, 80, 20, COL_ACCENT);
 		}
-		ui_text(FONT_SMALL, 272, 420, COL_DIM, "Please don't remove the cartridge.", 0);
+		phase = worker_busy ? work_phase() : NULL;
+		if (phase)
+			ui_text(FONT_SMALL, 272, 396, COL_ACCENT, phase, 736);
+		ui_text(FONT_SMALL, 272, 432, COL_DIM, "Please don't remove the cartridge.", 0);
 		break;
 	case DLG_RESULT:
 		for (i = 1, n = 0; i < 4; i++)
@@ -949,6 +1384,8 @@ static void render(void)
 		draw_cart_page();
 	else if (page == PAGE_SETTINGS)
 		draw_settings();
+	else if (page == PAGE_SAVES)
+		draw_saves();
 	else
 		draw_games();
 	draw_footer();
@@ -1049,7 +1486,7 @@ int main(void)
 {
 	char path[SQ_PATH_LEN];
 	Uint32 last_poll = 0, last_busy_draw = 0, settle_at = 0, warm_until, last_warm = 0;
-	Uint32 done_at = 0;
+	Uint32 done_at = 0, last_dots = 0;
 	int settle = 0;
 	FILE* fp;
 
@@ -1076,6 +1513,8 @@ int main(void)
 	sq_cart_scan(&cart);
 	cart_present = cart.present;
 	cart_generation = cart.generation;
+	cart_changed();
+	cart_writable = sq_reader_writable();
 	if (dialog == DLG_NONE && cart.present && sq_write_check(&cart, &task_result))
 		dialog = DLG_RESULT;
 	/* The session checked a save written to the cartridge (PrepareCart,
@@ -1122,6 +1561,8 @@ int main(void)
 			wait = CART_POLL_MS;
 		if (dialog == DLG_BUSY && wait > 100)
 			wait = 100;
+		if (cart_reading && wait > 400)
+			wait = 400;
 		if (!art_path[0] && (Sint32)(art_due - now) > 0 && (int)(art_due - now) < wait)
 			wait = art_due - now + 1;
 		if (script && wait > 20)
@@ -1154,14 +1595,19 @@ int main(void)
 		if (is_list_page(page) && game_count > 0 && !art_path[0] &&
 				(Sint32)(now - art_due) >= 0)
 			dirty = 1;
+		/* "Reading cartridge..." counts its dots */
+		if (cart_reading && now - last_dots >= 400) {
+			last_dots = now;
+			dirty = 1;
+		}
 		if (dialog == DLG_BUSY) {
 			/* A finished copy stays a moment at 100% "Done", so the end of
 			 * the bar is seen, then the result */
-			if (!worker_busy && work_total > 0 && !done_at) {
+			if (!worker_busy && work_total > 0 && task_result.ok && !done_at) {
 				done_at = now;
 				dirty = 1;
 			}
-			if (!worker_busy && (work_total == 0 || now - done_at >= DONE_MS)) {
+			if (!worker_busy && (work_total == 0 || !task_result.ok || now - done_at >= DONE_MS)) {
 				done_at = 0;
 				pthread_join(worker, NULL);
 				sq_log("%s %s %s", work_title, task_result.line[0], task_result.line[1]);
@@ -1196,6 +1642,7 @@ int main(void)
 	if (worker_busy)
 		pthread_join(worker, NULL);
 	free_games();
+	free(rom_choices);
 	/* Shutting SDL down hands the screen back; it mustn't keep the game
 	 * waiting (the request is already written) */
 	signal(SIGALRM, exit_now);

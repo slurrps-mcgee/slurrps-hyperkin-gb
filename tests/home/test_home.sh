@@ -27,10 +27,11 @@ NewHomeSandbox(){
 }
 
 # RunHome SCRIPT: run the home screen until the script ends or it hands
-# something over
+# something over. The sandbox's stubs (mount, hdparm) come first on its
+# PATH, for cart-event write-enable.
 RunHome(){
 	rm -f "$REQ"
-	PATH=$HOST_PATH SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+	PATH=$R/bin:$HOST_PATH SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
 		SQ_HOME_SCRIPT="$1" SQ_HOME_SHOTS="${SQTOOLS_SHOTS:-}" \
 		SQ_HOME_TEST_PAD="${SQ_HOME_TEST_PAD:-}" \
 		timeout 30 "$SQHOME_BIN" > "$R/home.log" 2>&1
@@ -121,6 +122,60 @@ mkdir -p "$RUN_DIR"
 printf 'OK=1\nYour save is on the cartridge.\nThe save written to it earlier was read back\n' > "$RUN_DIR/write-check.txt"
 RunHome "shot:home-write-ok quit"
 Check "the session's verdict is shown once" test ! -f "$RUN_DIR/write-check.txt"
+
+echo "a game written to the cartridge"
+# Down x5 = Write a game to the cartridge: the first game that fits
+# (Advance Wars), Yes, then "Write it"
+RunHome "a down down down down down a shot:home-write-rom-list a right shot:home-write-rom-confirm a right a wait shot:home-write-rom a quit"
+Check "written over the start of the cartridge's game" Equal "$(head -c 2 "$READER_DIR/Pokemon_LeafGreen.gba")" x
+Check "the cartridge's file keeps its size" Equal "$(wc -c < "$READER_DIR/Pokemon_LeafGreen.gba" | tr -d ' ')" 262144
+Check "read back and logged" Contains "$LOG_DIR/launcher.log" "game written to the cartridge and read back identical"
+Check "locked again" Contains "$R/proc/mounts" " $READER_DIR vfat ro"
+Check "remembered for the check when it's put back" Contains "$R/userdata/home/cart-write-check" "KIND=rom"
+RunHome "shot:home-write-rom-check quit"
+Check "checked when it's back: the game is on it" Contains "$LOG_DIR/launcher.log" \
+	"the written game is on the cartridge"
+Check "and the check is done" test ! -f "$R/userdata/home/cart-write-check"
+echo 1 > "$RUN_DIR/reader-wp"
+cp "$READER_DIR/Pokemon_LeafGreen.gba" "$R/before.gba"
+RunHome "a down down down down down shot:home-write-protected a a right a right a quit"
+Check "write protected: writing is greyed out" cmp -s "$READER_DIR/Pokemon_LeafGreen.gba" "$R/before.gba"
+Check "(and it was the cartridge page)" eval '! grep -q "request: game" "$R/home.log"'
+echo 0 > "$RUN_DIR/reader-wp"
+
+echo "the slot reading a cartridge"
+NewHomeSandbox
+SetCfg CART_AUTOLOAD 0
+LoadMedium Golden_Sun.gba 65536
+RunHome "sleep:900 shot:home-reading quit"
+Check "shown while it's read (no crash)" Equal "$RC" 0
+
+echo "options: deleting a game"
+NewHomeSandbox
+# Opens on Game Boy Advance (nothing played): A in, Select, down down = Delete
+RunHome "a select shot:home-options down down a a quit"
+Check "asks first, No is the default" test -f "$R/userdata/roms/gba/Advance Wars.gba"
+RunHome "a select down down a right shot:home-delete-game a shot:home-deleted a quit"
+Check "the game is deleted" test ! -f "$R/userdata/roms/gba/Advance Wars.gba"
+Check "the others are kept" test -f "$R/userdata/roms/gba/Golden Sun.gba"
+RunHome "a select down a quit"
+Check "options: add to favorites" Contains "$R/userdata/home/favorites.txt" "Golden Sun.gba"
+RunHome "a select a"
+Check "options: play" Equal "$(Req ROM)" "/userdata/roms/gba/Golden Sun.gba"
+
+echo "the saves page"
+echo s > "$R/userdata/roms/gba/Golden Sun.srm"
+mkdir -p "$R/userdata/saves/Golden_Sun"
+echo b > "$R/userdata/saves/Golden_Sun/001-cartridge.sav"
+# Opens on Recently played now: down x5 = Saves. The game's save first,
+# then its backup.
+RunHome "down down down down down a shot:home-saves down a shot:home-save-options a right a a quit"
+Check "a backup is deleted (asked once)" test ! -f "$R/userdata/saves/Golden_Sun/001-cartridge.sav"
+Check "the game's save is kept" test -f "$R/userdata/roms/gba/Golden Sun.srm"
+RunHome "down down down down down a a a right a quit"
+Check "a game's save is asked about twice" test -f "$R/userdata/roms/gba/Golden Sun.srm"
+RunHome "down down down down down a a a right a right shot:home-delete-save a a quit"
+Check "then deleted" test ! -f "$R/userdata/roms/gba/Golden Sun.srm"
 
 echo "stopped by sq-session"
 NewHomeSandbox

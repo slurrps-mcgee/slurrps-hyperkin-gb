@@ -1,6 +1,6 @@
 # Retron SQ Custom Firmware
 
-**v0.3.1 beta**: custom firmware for the Hyperkin Retron SQ. Play Game Boy,
+**v0.3.2 beta**: custom firmware for the Hyperkin Retron SQ. Play Game Boy,
 Game Boy Color and Game Boy Advance cartridges as before, or ROMs from the SD
 card with no cartridge at all, from a simple home screen, with the full
 RetroArch menu on Start + Select in any game.
@@ -18,6 +18,19 @@ Changing or extending it: [docs/DEVELOPING.md](docs/DEVELOPING.md).
 > works and what doesn't.
 
 ## What's new
+
+**In v0.3.2:**
+
+| | |
+| --- | --- |
+| **"Reading cartridge..."** | The top right of the home screen says when the slot is reading an inserted cartridge, then shows its name. |
+| **Cartridge details** | The Cartridge page shows what the cartridge is next to its tools: system, game code, size, save type, whether it's writable, the slot's checksum. |
+| **Writable or not** | Options that write to the cartridge are greyed out (with the reason) when the slot reports it as write protected. |
+| **Write a game to the cartridge** *(experimental)* | Put a game from `roms/` onto a rewritable (flash) cartridge. See [below](#writing-a-game-to-the-cartridge-experimental). |
+| **Progress for everything** | Backing up, restoring and writing saves show the same progress as copying a cartridge: KB or MB done, speed, time left, and what step it's on. |
+| **Saves page** | Every save on the SD card in one list: the saves games play with, cartridge saves and backups, with size and date. |
+| **Delete games and saves** | **Select** on a game opens its options (play, favorite, delete); on the Saves page, **A** or **Select** deletes a save or backup. |
+| **Fewer false checksum alarms** | A cartridge whose checksum doesn't match the slot's but reads exactly the same twice is trusted, not flagged. See [Checksums](#checksums). |
 
 **In v0.3.1:**
 
@@ -68,7 +81,7 @@ froze on start in both. Use v0.2.2 or later.
 | **Cartridges load instantly** | A cartridge is read once; after that it starts in moments from its copy on the SD card. |
 | **Clear loading screen** | The first read of a cartridge shows its name, progress, MB copied and time left. |
 | **Cartridge Tools** | Play the cartridge, copy it to the SD card, back up its save, restore a save, all from the menu. |
-| **Cartridges are read-only** | Saves live on the SD card, with automatic backups of every cartridge save. (v0.2.2 adds one deliberate exception, see *Write a save to the cartridge*.) |
+| **Cartridges are read-only** | Saves live on the SD card, with automatic backups of every cartridge save. (The deliberate exceptions: *Write a save / a game to the cartridge*, when you ask.) |
 | **FAT32 SD card** | Shows up as **RETRONSQ** on any PC, and grows to fill the whole card (up to 128 GB) on first boot. |
 | **Extra emulator cores** | Drop libretro cores onto the card and use them, or make one the default. |
 | **Shaders** | 17 GLSL shaders that run on the console's GPU (LCD grids, Game Boy palettes, CRT...). |
@@ -83,7 +96,7 @@ froze on start in both. Use v0.2.2 or later.
 2. Write the `.img` to the console's microSD card with a USB card reader:
    - **Fedora/GNOME:** open *Disks*, select the card, ⋮ → *Restore Disk Image…*
    - **Any OS:** balenaEtcher (or Rufus on Windows)
-   - **Terminal:** `sudo dd if=RetronSQ-CFW-v0.3.1-sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress`
+   - **Terminal:** `sudo dd if=RetronSQ-CFW-v0.3.2-sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress`
      (find `/dev/sdX` with `lsblk` first; it gets overwritten)
 3. Put the card in the console and switch it on.
 
@@ -231,15 +244,21 @@ are its pages; Up/Down picks one and A (or Right) goes in:
 
 | Page | What's there |
 | --- | --- |
-| **Cartridge** | The inserted cartridge, what it is, and its tools (below) |
+| **Cartridge** | The inserted cartridge's tools (below), and what it is |
 | **Recently played** | The last 30 games, cartridges included |
 | **Favorites** | Games you marked with **Y** |
 | **Game Boy Advance**, **Color**, **Game Boy** | Your games from `roms/` on the SD card |
+| **Saves** | Every save: the ones games play with, cartridge saves, and backups |
 | **Cartridge dumps** | Every cartridge played before, playable without it |
 | **Settings** | See below |
 
-In a list, **A** plays the game, **Y** marks it as a favorite (★), **L/R**
-jump a page, **B** or Left goes back. The selected game's picture shows on
+In a list, **A** plays the game, **Y** marks it as a favorite (★),
+**Select** opens its options (*Play*, *Add to favorites*, *Delete game...*),
+**L/R** jump a page, **B** or Left goes back. Deleting a game keeps its
+saves. On the **Saves** page, **A** or **Select** offers to delete a save
+or backup; a save a game plays with is asked about twice.
+
+![Saves page](docs/images/home-saves.png) The selected game's picture shows on
 the right (see [Box art](#box-art)). Questions have **No** / **Yes**
 buttons: pick with Left/Right, press A (No is always selected first, B
 always means No). The home screen only redraws when something changes, so
@@ -262,7 +281,7 @@ it leaves the console's CPU idle.
 | --- | --- |
 | **Start + Select** | Open the RetroArch menu in a game: save/load state, shaders, settings, *Close Content* to go back home |
 | **Reset button** | Restart the game |
-| D-pad, A / B, Y, L / R | Home screen: move, open / back, favorite, page |
+| D-pad, A / B, Y, Select, L / R | Home screen: move, open / back, favorite, options, page |
 
 The home screen uses RetroArch's own controller profiles
 (`retroarch/autoconfig`), so a pad works the same in both.
@@ -271,24 +290,53 @@ The home screen uses RetroArch's own controller profiles
 
 ![Cartridge page](docs/images/home-cartridge.png)
 
-On the home screen's **Cartridge** page. (With *Start screen* set to
-*RetroArch menu*, the same tools are under **Load Content → Collections →
-Cartridge Tools**.)
+On the home screen's **Cartridge** page, with what the cartridge is on the
+right: system, game code, size, save type, whether it's writable, and the
+slot's checksum. While the slot is still reading a cartridge, the top right
+of the screen says *Reading cartridge...*. (With *Start screen* set to
+*RetroArch menu*, the same tools, except writing a game, are under **Load
+Content → Collections → Cartridge Tools**.)
+
+Options that can't work on this cartridge are greyed out, and the line
+under them says why: writing when the slot reports the cartridge as write
+protected, save options when it has no save. Everything that takes a while
+shows its progress: KB or MB done, speed, time left, and the step it's on.
 
 | Option | What it does |
 | --- | --- |
 | **Play cartridge** | Start the cartridge in the slot (also with `CART_AUTOLOAD=0`). |
-| **Copy cartridge to SD card** | Dump the game into `roms/<system>/` with its save, so it plays without the cartridge. Shows MB copied, speed and time left, then *Done* and where it went. Checked against the cartridge's checksum; a game already there isn't copied twice. |
+| **Copy cartridge to SD card** | Dump the game into `roms/<system>/` with its save, so it plays without the cartridge. Shows MB copied, speed and time left, then *Done* and where it went. Checked against the cartridge's checksum (see [Checksums](#checksums)); a game already there isn't copied twice. |
 | **Back up cartridge save** | Dump the cartridge's save into `saves/<game>/`. |
 | **Restore a save...** | Choose which save to use when playing the cartridge: any backup, or the save on the cartridge now. The save it replaces is backed up first. |
 | **Write a save to the cartridge...** *(experimental)* | Put a save onto the cartridge itself: the one you play with now, or any backup. See below. |
+| **Write a game to the cartridge...** *(experimental)* | Put a game from `roms/` onto a rewritable (flash) cartridge. See below. |
+
+### Checksums
+
+The cartridge slot gives a checksum of the cartridge's game (the `.crc`
+file next to the game on its drive, shown on the Cartridge page). The
+console computes the same kind of checksum of what it reads (the slot's own
+CRC-32 variant, taken from the stock firmware) and compares the two:
+
+- **They match:** the copy is exact.
+- **They don't match, but a second read gives exactly the same data:** the
+  copy is kept and trusted (*"Checked by reading it twice"*). A dirty
+  contact makes reads differ from each other; a mismatch that repeats
+  exactly means it's the slot's checksum that disagrees, which happens with
+  some genuine cartridges.
+- **The two reads differ:** the copy is kept so the game runs, and the
+  message asks you to clean the cartridge's contacts and copy again.
+
+Every mismatch is logged in `logs/launcher.log` with both checksums and the
+game's size. The stock firmware did the same check but never told you: it
+silently copied the cartridge again on every start.
 
 ### Saves are kept on the SD card
 
 **Playing never writes to a cartridge.** The cartridge reader is mounted
 read-only and its device is locked read-only, so nothing can change a
-cartridge or its save, except *Write a save to the cartridge* when you ask
-for it.
+cartridge or its save, except *Write a save (or a game) to the cartridge*
+when you ask for it.
 
 - The first time a cartridge is played, its save is copied to the SD card
   (`rom/<game>.srm`). From then on every save goes there.
@@ -298,6 +346,8 @@ for it.
   Boy in between, nothing is lost.
 - To go back to the save on the cartridge, use **Cartridge → Restore a
   save... → Save on the cartridge now**.
+- The **Saves** page on the home screen lists them all, and can delete a
+  save or a backup you no longer want.
 - In-game saves are written to the SD card within about 2 seconds, in a way
   that a power cut can't corrupt (the old save stays until the new one is
   complete). Still, give it a few seconds after saving before switching off.
@@ -330,6 +380,29 @@ it* and press A; *No* is always the default).
   not known yet whether the Retron SQ's cartridge slot passes writes on to
   the cartridge's save chip. Please report what the check says.
 - Don't remove the cartridge or switch off while it writes.
+
+### Writing a game to the cartridge (experimental)
+
+**Cartridge → Write a game to the cartridge...** puts a game from `roms/`
+onto the cartridge in the slot. It's meant for rewritable (flash)
+cartridges: an original cartridge's game is on a read-only chip and can't
+be replaced.
+
+- Only games that can fit are offered: a `.gba` for a Game Boy Advance
+  cartridge, a `.gb` / `.gbc` for a Game Boy one, no bigger than the
+  cartridge's game (the cartridge's drive can't grow). Unzip a `.zip` first.
+- It replaces the cartridge's game: **copy the cartridge to the SD card
+  first** if you want to keep it. Its save is backed up automatically.
+- Confirmed twice, greyed out when the slot is write protected, and done
+  like a save write: unlocked only for the write, written in place, read
+  back and compared, locked again.
+- **Checked when you put it back:** the cartridge may come back under the
+  new game's name; the console compares the start of whatever is inserted
+  with the game written and says *"The game is on the cartridge"* or *"The
+  cartridge still has its old game"*.
+- **Experimental:** whether the slot passes these writes on to a flash
+  cartridge isn't known yet. Please report what happens (and
+  `logs/launcher.log`).
 
 **If a game says its save is corrupted**, nothing is lost: every save the
 cartridge ever had is in `saves/<game>/`. Use **Restore a save...** to pick

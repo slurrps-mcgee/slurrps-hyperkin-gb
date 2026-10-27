@@ -27,13 +27,21 @@ static void result(struct sq_result* r, int ok, const char* l1, const char* l2,
 	}
 }
 
-/* A failure: the headline, then the library's message over two lines */
+/* A failure: the headline, then the library's message over two lines,
+ * broken between words */
 static void failed(struct sq_result* r, const char* what, const struct sq_error* e)
 {
 	char l2[SQ_RESULT_COLS + 1], l3[SQ_RESULT_COLS + 1] = "";
-	snprintf(l2, sizeof(l2), "%s", e->msg);
-	if (strlen(e->msg) > SQ_RESULT_COLS)
-		snprintf(l3, sizeof(l3), "%s", e->msg + SQ_RESULT_COLS);
+	size_t len = strlen(e->msg), cut = len;
+	if (len > SQ_RESULT_COLS) {
+		for (cut = SQ_RESULT_COLS; cut > 0 && e->msg[cut] != ' '; cut--)
+			;
+		if (cut == 0)
+			cut = SQ_RESULT_COLS;
+	}
+	snprintf(l2, sizeof(l2), "%.*s", (int)cut, e->msg);
+	if (cut < len)
+		snprintf(l3, sizeof(l3), "%s", e->msg + cut + (e->msg[cut] == ' '));
 	result(r, 0, what, l2, l3[0] ? l3 : NULL, NULL);
 }
 
@@ -110,18 +118,22 @@ void sq_do_copy_to_library(const struct sq_cart* c, sq_progress_fn progress,
 		return;
 	}
 	*added = 1;
-	if (verified)
+	if (verified == SQ_VERIFIED_TWICE)
+		result(r, 1, "Copied to", line1, line2, save_copied
+			? "Checked by reading it twice; save copied too." : "Checked by reading it twice.");
+	else if (verified)
 		result(r, 1, "Copied to", line1, line2, save_copied ? "Its save was copied too." : NULL);
 	else
-		result(r, 0, "Copied, but the checksum doesn't match:", line2,
-			"the cartridge may be dirty or a reproduction.", NULL);
+		result(r, 0, "Copied, but two reads gave different data:", line2,
+			"clean the cartridge's contacts and copy again.", NULL);
 }
 
-void sq_do_backup_save(const struct sq_cart* c, struct sq_result* r)
+void sq_do_backup_save(const struct sq_cart* c, sq_progress_fn progress, void* ctx,
+	struct sq_result* r)
 {
 	char line[SQ_RESULT_COLS + 1];
 	struct sq_error e = { "", 0 };
-	int existed, n = sq_backup_cart_save(c, &existed, &e);
+	int existed, n = sq_backup_cart_save(c, &existed, progress, ctx, 0, &e);
 
 	snprintf(line, sizeof(line), "saves/%s/ as #%d", c->base, n);
 	if (n < 0)
@@ -132,10 +144,11 @@ void sq_do_backup_save(const struct sq_cart* c, struct sq_result* r)
 		result(r, 1, "The cartridge's save is backed up in", line, NULL, NULL);
 }
 
-void sq_do_restore_save(const struct sq_cart* c, const char* path, struct sq_result* r)
+void sq_do_restore_save(const struct sq_cart* c, const char* path,
+	sq_progress_fn progress, void* ctx, struct sq_result* r)
 {
 	struct sq_error e = { "", 0 };
-	if (sq_restore_save(c, path, &e) != 0)
+	if (sq_restore_save(c, path, progress, ctx, &e) != 0)
 		failed(r, "Restore failed:", &e);
 	else
 		result(r, 1, "Save restored.", "It is used the next time you play the cartridge.",
@@ -151,7 +164,7 @@ static int run_rw(const char* rw_cmd, const char* what)
 }
 
 void sq_do_write_save(const struct sq_cart* c, const char* path, const char* rw_cmd,
-	struct sq_result* r)
+	sq_progress_fn progress, void* ctx, struct sq_result* r)
 {
 	struct sq_error e = { "", 0 };
 	struct sq_gen3_report g;
@@ -192,7 +205,7 @@ void sq_do_write_save(const struct sq_cart* c, const char* path, const char* rw_
 	}
 
 	/* The cartridge's own save is kept before it is unlocked */
-	n = sq_backup_cart_save(c, &existed, &e);
+	n = sq_backup_cart_save(c, &existed, progress, ctx, 0, &e);
 	if (n < 0) {
 		failed(r, "Backing up the cartridge's save failed:", &e);
 		goto done;
@@ -205,7 +218,7 @@ void sq_do_write_save(const struct sq_cart* c, const char* path, const char* rw_
 			"Nothing was changed. See logs/launcher.log.", NULL, NULL);
 		goto done;
 	}
-	rc = sq_write_cart_save(c, data, size, &e);
+	rc = sq_write_cart_save(c, data, size, progress, ctx, c->save_size, &e);
 	if (run_rw(rw_cmd, "write-disable") != 0)
 		sq_log_sd("tools: locking the cartridge again failed");
 	snprintf(line, sizeof(line), "Its previous save is backup #%d.", n);
@@ -224,4 +237,68 @@ void sq_do_write_save(const struct sq_cart* c, const char* path, const char* rw_
 	}
 done:
 	free(data);
+}
+
+void sq_do_write_rom(const struct sq_cart* c, const char* path, const char* rw_cmd,
+	sq_progress_fn progress, void* ctx, struct sq_result* r)
+{
+	struct sq_error e = { "", 0 };
+	char line[SQ_RESULT_COLS + 1] = "";
+	int existed, n = 0, rc;
+
+	/* Everything that can refuse comes before anything changes */
+	if (sq_reader_writable() == 0) {
+		result(r, 0, "This cartridge slot can't write:",
+			"it reports the cartridge as write protected.",
+			"Nothing was changed.", NULL);
+		return;
+	}
+	if (sq_cart_rom_fits(c, path, &e) != 0) {
+		failed(r, "That game can't go on this cartridge:", &e);
+		return;
+	}
+
+	/* The cartridge's save is kept first: a new game may not keep it */
+	if (c->save_size > 0) {
+		n = sq_backup_cart_save(c, &existed, progress, ctx, 0, &e);
+		if (n < 0) {
+			failed(r, "Backing up the cartridge's save failed:", &e);
+			return;
+		}
+		snprintf(line, sizeof(line), "Its old save is backup #%d.", n);
+	}
+	sq_log_sd("tools: writing the game %s (%ld bytes) to the cartridge %s (%ld bytes)",
+		path, sq_file_size(path), c->rom, c->rom_size);
+	if (run_rw(rw_cmd, "write-enable") != 0) {
+		sq_log_sd("tools: the cartridge couldn't be opened for writing");
+		result(r, 0, "The cartridge couldn't be opened for writing.",
+			"Nothing was changed. See logs/launcher.log.", NULL, NULL);
+		return;
+	}
+	rc = sq_write_cart_rom(c, path, progress, ctx, c->save_size, &e);
+	if (run_rw(rw_cmd, "write-disable") != 0)
+		sq_log_sd("tools: locking the cartridge again failed");
+	if (rc == 0) {
+		/* As with a save: proven only once the cartridge comes back */
+		sq_log_sd("tools: game written to the cartridge and read back identical");
+		sq_write_check_remember_rom(c, path);
+		result(r, 1, "Written to the cartridge.",
+			"To check it took: take the cartridge out",
+			"and put it back in.", line[0] ? line : NULL);
+		return;
+	}
+	sq_log_sd("tools: writing the game to the cartridge failed: %s", e.msg);
+	if (strstr(e.msg, "part of it"))
+		result(r, 0, "Only part of the game was written.",
+			"The cartridge may not start now; write it",
+			"again, or write its old game back.", line[0] ? line : NULL);
+	else if (strstr(e.msg, "reads back different"))
+		result(r, 0, "The cartridge didn't take the game.",
+			"It reads back different from the game: this",
+			"cartridge or slot can't be rewritten.", line[0] ? line : NULL);
+	else {
+		failed(r, "Writing the game failed:", &e);
+		if (line[0])
+			snprintf(r->line[3], sizeof(r->line[3]), "%s", line);
+	}
 }

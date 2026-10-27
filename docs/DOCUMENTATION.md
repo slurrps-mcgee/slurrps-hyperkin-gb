@@ -313,10 +313,30 @@ current state: a quick tap's press and release can arrive in one batch,
 and reading the state would lose the press.
 
 **Cartridge page.** The same actions as Cartridge Tools (below), from the
-same code (`sq_do_*` in `src/lib/actions.c`), run in a worker thread. A
-copy shows percent, MB copied, speed and time left: libsqcart's
-`sq_meter_text`, which the loading screen and the tools core use too, so all
-three say the same.
+same code (`sq_do_*` in `src/lib/actions.c`), run in a worker thread, plus
+*Write a game to the cartridge*. Every action reports progress and says
+what it counts up to (the totals are in `sqcart.h`), so each shows percent,
+KB or MB done, speed and time left (libsqcart's `sq_meter_text`, which the
+loading screen and the tools core use too), and the writes also the step
+they're on (backing up, writing, reading back). A failed action goes
+straight to its message instead of a moment of "Done". On the right, the
+cartridge's details: from the scan, the slot's `.crc` (read once per
+cartridge), and `sq_reader_writable()`. Write options are greyed out when
+the slot reports write protection, with the reason under the list.
+
+**Reading cartridge...** The cartridge poll (twice a second) also looks at
+`sq_reader_state()`: while it is `pending` (the slot is on USB with a
+medium, not mounted yet) the header's top right says *Reading
+cartridge...*, redrawn every 400 ms for its dots, then the cartridge's
+name once it is mounted.
+
+**Saves page and options.** `sq_saves_scan` (`library.c`) lists the live
+saves (`.srm` in `roms/` and `rom/`) and the backups in `saves/`, by game.
+**Select** on a game opens its options (play, favorite, delete); on the
+Saves page A or Select. `sq_delete_game` / `sq_delete_save` only delete game
+files under `roms/` and `rom/` (a cartridge copy's `.crc` goes too) and
+saves under `roms/`, `rom/` and `saves/`; anything else, or a path with
+`..`, is refused. A live save is asked about twice.
 
 **Dialogs** have real buttons: questions *No* and *Yes* (or *Write it*),
 picked with Left/Right and pressed with A, with *No* selected first; B is
@@ -437,9 +457,9 @@ Two independent locks keep anything from writing to a cartridge:
    refuses every write to it, whoever tries.
 2. **Mount.** `/media/cart` is mounted `ro`.
 
-Nothing in the firmware writes there, except one function:
-`sq_write_cart_save` (`src/lib/cartwrite.c`), used only by Cartridge Tools'
-*Write a save to the cartridge*.
+Nothing in the firmware writes there, except two functions in
+`src/lib/cartwrite.c`: `sq_write_cart_save` for *Write a save to the
+cartridge* and `sq_write_cart_rom` for *Write a game to the cartridge*.
 
 ### Writing a save to the cartridge (experimental)
 
@@ -483,6 +503,27 @@ Every step goes to `launcher.log` (`tools:` and `cartridge:` lines).
    lines; the home screen shows the verdict when it next opens), and the
    home screen runs it itself when a cartridge appears on it.
 
+### Writing a game to the cartridge (experimental)
+
+The same steps as a save (`sq_do_write_rom` in `actions.c`): write
+protection, checks that change nothing (`sq_cart_rom_fits`: `.gba` for a
+GBA cartridge, `.gb`/`.gbc` for a GB one, no `.zip`, no bigger than the
+cartridge's game file, which can't grow on the slot's drive), backup of the
+cartridge's save, `write-enable`, `sq_write_cart_rom`, `write-disable`.
+`sq_write_cart_rom` streams the game over the start of the cartridge's game
+file in 64 KB steps, in place, fsyncs, then reads it back past the page
+cache and compares it with the file; a difference after the start is
+reported as "part of it was written". Whether the slot's firmware turns
+these writes into flash programming on a rewritable cartridge is unknown
+(an original cartridge's mask ROM can't change).
+
+The re-insert check (`sq_write_check_remember_rom`) differs from a save's:
+the slot names the cartridge's file after its game, so the cartridge may
+come back under the new name. The record (`KIND=rom`) keeps the CRC of the
+first 64 KB written; whatever cartridge is inserted next is compared:
+match = "The game is on the cartridge", the old game (same name and size) =
+"still has its old game", another cartridge = not this check's.
+
 ### The copy
 
 `src/lib/copy.c` (`sq_copy`), used by `sqload`, `sqcart cache` and
@@ -505,11 +546,17 @@ flowchart LR
   renamed only once complete. A cartridge pulled mid-copy leaves no
   truncated ROM.
 - **Verification and retry** (`sq_cache_cartridge`). If the CRC doesn't
-  match the reader's `.crc`, the copy is retried once. If it still doesn't
-  match (common with reproduction carts), the ROM is kept so the game runs,
-  but **without** a cached `.crc`, so the next insert reads the cartridge
-  again. If the cartridge turns out to be gone after an unverified copy, the
-  copy is deleted: nothing vouches for its data.
+  match the reader's `.crc`, the cartridge is read again. If the second read
+  gives the same CRC as the first, the data is stable and the copy is
+  trusted (`SQ_VERIFIED_TWICE`): dirty contacts make reads differ, so a
+  mismatch that repeats exactly is the slot's checksum disagreeing (seen
+  with genuine cartridges), not a bad read. It gets a cached `.crc` like a
+  matching copy, so it isn't read again on every insert. Only when the two
+  reads differ is the ROM kept unverified (so the game runs), **without** a
+  cached `.crc`, so the next insert reads the cartridge again. If the
+  cartridge turns out to be gone after an unverified copy, the copy is
+  deleted: nothing vouches for its data. Every mismatching read is logged
+  to `launcher.log` with both CRCs and the ROM size.
 - **Space** (`make_room`). If the SD card is too full, old cartridge copies
   in `/userdata/rom` are deleted, largest first. Saves and save states are
   never deleted.
@@ -671,10 +718,11 @@ screen (320×240, RGB565, RetroArch's RGUI font) and reads the pad.
 | Action | Implementation |
 | --- | --- |
 | Play cartridge | Tools core: writes `/run/retronsq/play-cart`, clears `cart-failed`, and sends RetroArch SIGTERM (a clean exit). Home screen: the `cart` request. Either way sq-session plays the cartridge, even with `CART_AUTOLOAD=0`. |
-| Copy cartridge to SD card | `sq_dump_to_library`: copies the ROM to `roms/<system>/<name>`, verified against the reader's CRC (a mismatch is retried once). A verified copy in `rom/` is used as the source when there is one (same data, much faster). If the library already has that game (same size and CRC), nothing is copied. A different game with the same name becomes `<name> (2)`. The save comes along as `<name>.srm` (the live save if there is one, else the cartridge's). Then `sq-scan-roms` runs so it shows in Collections at once. |
+| Copy cartridge to SD card | `sq_dump_to_library`: copies the ROM to `roms/<system>/<name>`, verified against the reader's CRC (a mismatch is read again; two identical reads are trusted, see *The copy*). A trusted copy in `rom/` is used as the source when there is one (same data, much faster). If the library already has that game (same size, and the slot's CRC or the same data as the trusted copy or this read), nothing is copied. A different game with the same name becomes `<name> (2)`. The save comes along as `<name>.srm` (the live save if there is one, else the cartridge's). Then `sq-scan-roms` runs so it shows in Collections at once. |
 | Back up cartridge save | `sq_backup_cart_save`: `saves/<game>/NNN-cartridge.sav`, unless an identical backup exists. |
 | Restore a save... | Lists the cartridge's current save and every backup, newest first. On confirm, `sq_restore_save` backs up the live save as `NNN-before-restore.sav` (if not already backed up), then writes the chosen save as the live save. |
-| Write a save to the cartridge... | Experimental. Lists the live save and every backup; asks twice. Then the steps in [Writing a save to the cartridge](#writing-a-save-to-the-cartridge-experimental). `cart-event` is run as `CART_RW_CMD`, which the tests replace. |
+| Write a game to the cartridge... | Home screen only. Experimental. Lists the games in `roms/` that fit (`sq_cart_rom_fits`); asks twice. Then the steps in [Writing a game to the cartridge](#writing-a-game-to-the-cartridge-experimental). |
+| Write a save to the cartridge... | Experimental. Greyed out when the slot reports write protection. Lists the live save and every backup; asks twice. Then the steps in [Writing a save to the cartridge](#writing-a-save-to-the-cartridge-experimental). `cart-event` is run as `CART_RW_CMD`, which the tests replace. |
 | Back to RetroArch menu | `RETRO_ENVIRONMENT_SHUTDOWN`. With `load_dummy_on_core_shutdown` on, RetroArch returns to its menu. |
 
 Restoring only changes the save used when playing **from the cartridge**
@@ -711,13 +759,13 @@ browsed through *Start directory* use whatever core you pick there.
 
 The firmware version lives in the `VERSION` file at the top of the tree
 (`RETRONSQ_VERSION` in the environment overrides it; the release workflow
-sets it). While the major version is 0, " beta" is added: `0.3.1` is shown as
-**v0.3.1 beta**.
+sets it). While the major version is 0, " beta" is added: `0.3.2` is shown as
+**v0.3.2 beta**.
 
 A Buildroot finalize hook in `retronsq.mk` (`RETRONSQ_INSTALL_VERSION`)
 runs on every build:
 
-- writes `/etc/retronsq-version` ("Retron SQ CFW v0.3.1 beta"), printed at
+- writes `/etc/retronsq-version` ("Retron SQ CFW v0.3.2 beta"), printed at
   boot and shown by the home screen and Cartridge Tools;
 - fills `@VERSION_LABEL@` into the two SVG templates in
   `buildroot/package/retronsq/splash/` and renders them with `rsvg-convert`
@@ -911,7 +959,7 @@ is the problem; restore an older backup from Cartridge Tools.
 
 | File | Installed as | Role |
 | --- | --- | --- |
-| `src/lib/` | (linked in) | libsqcart: `sqcart.h` (API and paths), `common.c` (paths, errors, logs, files, atomic write), `crc.c`, `copy.c` (pipelined copy), `cart.c` (reader state, scan, cache, library copy), `save.c` (import, backups, restore, Gen 3 check), `cartwrite.c` (writing a save to the cartridge), `actions.c` (the cartridge actions as the user sees them), `config.c` (settings), `library.c` (games, history, favorites, box art) |
+| `src/lib/` | (linked in) | libsqcart: `sqcart.h` (API and paths), `common.c` (paths, errors, logs, files, atomic write), `crc.c`, `copy.c` (pipelined copy), `cart.c` (reader state, scan, cache, library copy), `save.c` (import, backups, restore, Gen 3 check), `cartwrite.c` (writing a save or a game to the cartridge, the re-insert check), `actions.c` (the cartridge actions as the user sees them), `config.c` (settings), `library.c` (games, history, favorites, box art, the saves list, deleting) |
 | `src/cli/sqcart.c` | `/usr/bin/sqcart` | libsqcart for the scripts |
 | `src/load/sqload.c` | `/usr/bin/sqload` | loading screen + first copy |
 | `src/tools/sqtools.c` | `/usr/lib/libretro/sqtools_libretro.so` | Cartridge Tools core |

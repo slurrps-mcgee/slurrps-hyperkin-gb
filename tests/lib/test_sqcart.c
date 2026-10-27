@@ -15,6 +15,14 @@
 
 /* --- tests -------------------------------------------------------------- */
 
+/* The last progress an action reported */
+static long progress_seen;
+static void count_progress(long done, void* ctx)
+{
+	(void)ctx;
+	progress_seen = done;
+}
+
 static void test_crc(void)
 {
 	long sizes[] = { 1000, 512, 262144, 262144 * 3 + 123, 5242999 };
@@ -64,7 +72,7 @@ static void test_scan_and_cache(void)
 	CHECK(!sq_cache_valid(&c));
 
 	CHECK(sq_cache_cartridge(&c, &verified, NULL, NULL, &e) == 0);
-	CHECK(verified);
+	CHECK(verified == SQ_VERIFIED_CRC);
 	CHECK(size_of("/userdata/rom/Pokemon_LeafGreen.gba") == c.rom_size);
 	CHECK(exists("/userdata/rom/Pokemon_LeafGreen.crc"));
 	CHECK(!exists("/userdata/rom/Pokemon_LeafGreen.gba.part"));
@@ -76,15 +84,21 @@ static void test_scan_and_cache(void)
 	CHECK(sq_cache_cartridge(&c, &verified, NULL, NULL, &e) != 0);
 	CHECK(strstr(e.msg, "removed or changed") != NULL);
 
-	/* Repro cart whose CRC never matches: copy kept, not trusted */
+	/* A cartridge whose slot checksum never matches, read the same twice:
+	 * trusted (the slot's checksum is what disagrees), and logged */
 	clean();
 	insert_cart("Repro.gba", 262144, 0, 2, 0, 1);
 	sq_cart_scan(&c);
 	CHECK(sq_cache_cartridge(&c, &verified, NULL, NULL, &e) == 0);
-	CHECK(!verified);
+	CHECK(verified == SQ_VERIFIED_TWICE);
 	CHECK(exists("/userdata/rom/Repro.gba"));
-	CHECK(!exists("/userdata/rom/Repro.crc"));
-	CHECK(!sq_cache_valid(&c));
+	CHECK(exists("/userdata/rom/Repro.crc"));
+	CHECK(sq_cache_valid(&c));		/* not read from the cartridge every time */
+	{
+		char* log = read_text("/userdata/logs/launcher.log");
+		CHECK(log && strstr(log, "the slot says deadbeef") && strstr(log, "read twice"));
+		free(log);
+	}
 
 	/* Cartridge pulled: nothing to scan */
 	remove_cart();
@@ -115,9 +129,11 @@ static void test_saves(void)
 	CHECK(sq_same_content(p, other, 131072));
 
 	/* Backups: numbered, never stored twice */
-	n = sq_backup_cart_save(&c, &existed, &e);
+	progress_seen = 0;
+	n = sq_backup_cart_save(&c, &existed, count_progress, NULL, 10, &e);
 	CHECK(n == 1 && !existed);
-	n = sq_backup_cart_save(&c, &existed, &e);
+	CHECK(progress_seen == 10 + 131072);		/* base + the save read */
+	n = sq_backup_cart_save(&c, &existed, NULL, NULL, 0, &e);
 	CHECK(n == 1 && existed);
 	put("/userdata/saves/Game/009-before-restore.sav", "x", 1);
 	put("/userdata/saves/Game/010-cartridge.sav", "y", 1);
@@ -128,7 +144,9 @@ static void test_saves(void)
 	CHECK(!strcmp(list[1].kind, "cartridge") && !strcmp(list[2].kind, "before-restore"));
 
 	/* Restore backup #1: the live save becomes it, the old one is backed up */
-	CHECK(sq_restore_save(&c, list[3].path, &e) == 0);
+	progress_seen = 0;
+	CHECK(sq_restore_save(&c, list[3].path, count_progress, NULL, &e) == 0);
+	CHECK(progress_seen == 131072);
 	path(p, "/media/cart/Game.sav");
 	{
 		long sz;
@@ -169,6 +187,34 @@ static void test_dump_to_library(void)
 	CHECK(sq_dump_to_library(&c, out, sizeof(out), &already, &verified, &save_copied,
 		NULL, NULL, &e) == 0);
 	CHECK(!already && strstr(out, "Game (2).gba"));
+
+	/* A game whose slot checksum never matches: read twice, kept, and
+	 * recognised the next time instead of piling up "(3)", "(4)"... */
+	remove_cart();
+	insert_cart("Golden.gba", 262144, 0, 11, 0, 3);
+	sq_cart_scan(&c);
+	CHECK(sq_dump_to_library(&c, out, sizeof(out), &already, &verified, &save_copied,
+		NULL, NULL, &e) == 0);
+	CHECK(!already && verified == SQ_VERIFIED_TWICE && strstr(out, "/Golden.gba"));
+	CHECK(sq_dump_to_library(&c, out, sizeof(out), &already, &verified, &save_copied,
+		NULL, NULL, &e) == 0);
+	CHECK(already && strstr(out, "/Golden.gba") && !exists("/userdata/roms/gba/Golden (2).gba"));
+	/* Same after it was played (a trusted copy in the cache) */
+	CHECK(sq_cache_cartridge(&c, &verified, NULL, NULL, &e) == 0 && sq_cache_valid(&c));
+	CHECK(sq_dump_to_library(&c, out, sizeof(out), &already, &verified, &save_copied,
+		NULL, NULL, &e) == 0);
+	CHECK(already && !exists("/userdata/roms/gba/Golden (2).gba"));
+	{
+		struct sq_result r;
+		int added;
+		remove_cart();
+		path(out, "/userdata/roms/gba/Golden.gba");
+		unlink(out);
+		insert_cart("Golden.gba", 262144, 0, 11, 0, 4);
+		sq_cart_scan(&c);
+		sq_do_copy_to_library(&c, NULL, NULL, &added, &r);
+		CHECK(r.ok && added && strstr(r.line[3], "reading it twice"));
+	}
 }
 
 /* --- Gen 3 save checker ------------------------------------------------- */
@@ -215,28 +261,30 @@ static void test_cart_write(void)
 	path(p, "/media/cart/Game.sav");
 
 	/* Another size: refused, the cartridge's save untouched */
-	CHECK(sq_write_cart_save(&c, other, 65536, &e) != 0 && strstr(e.msg, "65536"));
+	CHECK(sq_write_cart_save(&c, other, 65536, NULL, NULL, 0, &e) != 0 && strstr(e.msg, "65536"));
 	CHECK(size_of("/media/cart/Game.sav") == 131072 && !sq_same_content(p, data, 131072));
 
 	/* Same size: written in place and read back */
-	CHECK(sq_write_cart_save(&c, data, 131072, &e) == 0);
+	progress_seen = 0;
+	CHECK(sq_write_cart_save(&c, data, 131072, count_progress, NULL, 5, &e) == 0);
+	CHECK(progress_seen == 5 + 2 * 131072);		/* written, then read back */
 	CHECK(sq_same_content(p, data, 131072));
 	CHECK(!exists("/media/cart/Game.sav.tmp") && !exists("/media/cart/Game.sav.part"));
 
 	/* A read-only cartridge file (not opened for writing): a clear error */
 	chmod(p, 0444);
-	CHECK(sq_write_cart_save(&c, data, 131072, &e) != 0 && strstr(e.msg, "opening"));
+	CHECK(sq_write_cart_save(&c, data, 131072, NULL, NULL, 0, &e) != 0 && strstr(e.msg, "opening"));
 	chmod(p, 0644);
 
 	/* Swapped since the scan: refused */
 	put_text("/run/retronsq/cart-generation", "9\n");
-	CHECK(sq_write_cart_save(&c, data, 131072, &e) != 0 && strstr(e.msg, "removed or changed"));
+	CHECK(sq_write_cart_save(&c, data, 131072, NULL, NULL, 0, &e) != 0 && strstr(e.msg, "removed or changed"));
 
 	/* No save on the cartridge: refused */
 	remove_cart();
 	insert_cart("NoSave.gba", 1024 * 1024, 0, 8, 1, 10);
 	sq_cart_scan(&c);
-	CHECK(sq_write_cart_save(&c, data, 131072, &e) != 0 && strstr(e.msg, "no save"));
+	CHECK(sq_write_cart_save(&c, data, 131072, NULL, NULL, 0, &e) != 0 && strstr(e.msg, "no save"));
 
 	/* Did it stick? Checked when the cartridge is next inserted: here a
 	 * cartridge that came back holding what was written */
@@ -271,6 +319,133 @@ static void test_cart_write(void)
 	}
 	free(data);
 	free(other);
+}
+
+/* Writing a game to a (rewritable) cartridge, experimental */
+static void test_rom_write(void)
+{
+	struct sq_cart c;
+	struct sq_error e;
+	struct sq_result r;
+	unsigned char* game = random_data(300000, 77);
+	char p[SQ_PATH_LEN], src[SQ_PATH_LEN];
+
+	clean();
+	insert_cart("Blank.gba", 1024 * 1024, 8192, 20, 1, 1);
+	sq_cart_scan(&c);
+	put("/userdata/roms/gba/Homebrew.gba", game, 300000);
+	put("/userdata/roms/gba/Huge.gba", game, 1);
+	put("/userdata/roms/gb/Tetris.gb", game, 32768);
+	put("/userdata/roms/gba/Pack.zip", game, 100);
+	path(src, "/userdata/roms/gba/Homebrew.gba");
+
+	/* What can't go on it, said before anything is written */
+	CHECK(sq_cart_rom_fits(&c, src, &e) == 0);
+	path(p, "/userdata/roms/gb/Tetris.gb");
+	CHECK(sq_cart_rom_fits(&c, p, &e) != 0 && strstr(e.msg, "can't go on"));
+	path(p, "/userdata/roms/gba/Pack.zip");
+	CHECK(sq_cart_rom_fits(&c, p, &e) != 0 && strstr(e.msg, "unzip"));
+	{
+		unsigned char* big = random_data(2 * 1024 * 1024, 78);
+		put("/userdata/roms/gba/Huge.gba", big, 2 * 1024 * 1024);
+		free(big);
+	}
+	path(p, "/userdata/roms/gba/Huge.gba");
+	CHECK(sq_cart_rom_fits(&c, p, &e) != 0 && strstr(e.msg, "holds 1.0 MB"));
+
+	/* Written over the start of the cartridge's game file, in place, and
+	 * read back: the file keeps its size */
+	progress_seen = 0;
+	CHECK(sq_write_cart_rom(&c, src, count_progress, NULL, 8192, &e) == 0);
+	CHECK(progress_seen == 8192 + 2 * 300000);
+	CHECK(size_of("/media/cart/Blank.gba") == 1024 * 1024);
+	{
+		long size;
+		unsigned char* now;
+		path(p, "/media/cart/Blank.gba");
+		now = sq_read_all(p, 2 * 1024 * 1024, &size);
+		CHECK(now && !memcmp(now, game, 300000));
+		free(now);
+	}
+
+	/* The whole action: refused when the slot is write protected */
+	put_text("/run/retronsq/reader-wp", "1\n");
+	sq_do_write_rom(&c, src, "true", NULL, NULL, &r);
+	CHECK(!r.ok && strstr(r.line[1], "write protected"));
+	put_text("/run/retronsq/reader-wp", "0\n");
+	sq_do_write_rom(&c, src, "true", NULL, NULL, &r);
+	CHECK(r.ok && strstr(r.line[0], "Written"));
+	CHECK(exists("/userdata/saves/Blank/001-cartridge.sav"));	/* its save kept first */
+
+	/* Checked when a cartridge comes back: under the new game's name... */
+	remove_cart();
+	insert_cart("Homebrew.gba", 1024 * 1024, 8192, 21, 1, 5);
+	path(p, "/media/cart/Homebrew.gba");
+	{
+		FILE* fp = fopen(p, "r+b");
+		CHECK(fp && fwrite(game, 1, 300000, fp) == 300000);
+		if (fp)
+			fclose(fp);
+	}
+	sq_cart_scan(&c);
+	CHECK(sq_write_check(&c, &r) == 1 && r.ok && strstr(r.line[0], "game is on"));
+	/* ...or the old one back: it didn't take */
+	insert_cart("Blank.gba", 1024 * 1024, 8192, 20, 1, 6);
+	sq_cart_scan(&c);
+	sq_write_check_remember_rom(&c, src);
+	remove_cart();
+	insert_cart("Other.gba", 1024 * 1024, 8192, 22, 1, 7);
+	sq_cart_scan(&c);
+	CHECK(sq_write_check(&c, &r) == 0);		/* another cartridge: not its check */
+	insert_cart("Blank.gba", 1024 * 1024, 8192, 20, 1, 8);
+	sq_cart_scan(&c);
+	CHECK(sq_write_check(&c, &r) == 1 && !r.ok && strstr(r.line[0], "old game"));
+	free(game);
+}
+
+/* The Saves page and deleting games and saves */
+static void test_saves_and_delete(void)
+{
+	struct sq_save_file* f = NULL;
+	struct sq_error e;
+	int n;
+
+	clean();
+	put("/userdata/roms/gba/Zelda.gba", "x", 1);
+	put("/userdata/roms/gba/Zelda.srm", "s", 1);
+	put("/userdata/roms/gb/Tetris.srm", "s", 1);
+	put("/userdata/rom/Pokemon_Emerald.gba", "x", 1);
+	put("/userdata/rom/Pokemon_Emerald.crc", "1234", 4);
+	put("/userdata/rom/Pokemon_Emerald.srm", "s", 1);
+	put("/userdata/saves/Pokemon_Emerald/001-cartridge.sav", "b", 1);
+	put("/userdata/saves/Pokemon_Emerald/002-before-restore.sav", "b", 1);
+
+	n = sq_saves_scan(&f);
+	CHECK(n == 5);
+	CHECK(n == 5 && !strcmp(f[0].label, "Pokemon Emerald") && f[0].live &&
+		!strcmp(f[0].kind, "Cartridge save"));
+	CHECK(n == 5 && f[1].backup == 2 && !strcmp(f[1].kind, "Backup #2 (before restore)"));
+	CHECK(n == 5 && f[2].backup == 1);
+	CHECK(n == 5 && !strcmp(f[3].label, "Tetris") && !strcmp(f[3].kind, "Game Boy save"));
+	CHECK(n == 5 && !strcmp(f[4].path, "/userdata/roms/gba/Zelda.srm"));	/* no $SQ_ROOT */
+	free(f);
+
+	/* Deleting: only games and saves, only in their folders */
+	CHECK(sq_delete_game("/userdata/roms/gba/Zelda.gba", &e) == 0);
+	CHECK(!exists("/userdata/roms/gba/Zelda.gba") && exists("/userdata/roms/gba/Zelda.srm"));
+	CHECK(sq_delete_game("/userdata/rom/Pokemon_Emerald.gba", &e) == 0);
+	CHECK(!exists("/userdata/rom/Pokemon_Emerald.crc"));	/* no longer a trusted copy */
+	CHECK(sq_delete_game("/userdata/roms/gba/Zelda.srm", &e) != 0);
+	CHECK(sq_delete_game("/userdata/retronsq.cfg", &e) != 0);
+	CHECK(sq_delete_game("/userdata/roms/../retronsq.gba", &e) != 0);
+	CHECK(sq_delete_save("/userdata/roms/gba/Zelda.srm", &e) == 0 && !exists("/userdata/roms/gba/Zelda.srm"));
+	CHECK(sq_delete_save("/userdata/saves/Pokemon_Emerald/001-cartridge.sav", &e) == 0);
+	CHECK(sq_delete_save("/userdata/roms/gb/Tetris.gb", &e) != 0);
+	CHECK(sq_delete_save("/userdata/home/history.txt", &e) != 0);
+	CHECK(sq_delete_save("/userdata/roms/gb/Missing.srm", &e) != 0 && strstr(e.msg, "deleting"));
+	n = sq_saves_scan(&f);
+	CHECK(n == 3);
+	free(f);
 }
 
 /* Settings: tolerant reading like CfgGet, writing that keeps the file */
@@ -389,6 +564,10 @@ static void test_meter(void)
 	sq_meter_text(&m, 1, 10, 0, size, sizeof(size), rate, sizeof(rate));
 	sq_meter_text(&m, 1 + 1024 * 400, 2010, 0, size, sizeof(size), rate, sizeof(rate));
 	CHECK(!strncmp(rate, "200 KB/s, about 2 min ", 22));
+
+	sq_meter_start(&m, 131072);			/* a save: KB */
+	sq_meter_text(&m, 65536, 100, 0, size, sizeof(size), rate, sizeof(rate));
+	CHECK(!strcmp(size, "64 of 128 KB"));
 }
 
 static void test_atomic_write(void)
@@ -415,6 +594,8 @@ int main(void)
 	test_gen3();
 	test_atomic_write();
 	test_cart_write();
+	test_rom_write();
+	test_saves_and_delete();
 	test_config();
 	test_library();
 	test_meter();

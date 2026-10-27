@@ -49,7 +49,7 @@
 #ifndef CART_RW_CMD
 #define CART_RW_CMD	"/usr/lib/retronsq/cart-event"
 #endif
-#define VERSION_FILE	"/etc/retronsq-version"		/* "Retron SQ CFW v0.3.1 beta" */
+#define VERSION_FILE	"/etc/retronsq-version"		/* "Retron SQ CFW v0.3.2 beta" */
 
 /* Leave RetroArch so sq-session takes over. SIGTERM makes RetroArch exit
  * cleanly (saving), like sq-session's own stop. Tests replace it. */
@@ -123,7 +123,7 @@ static char work_title[COLS + 1];
 static struct sq_meter meter;		/* "MB of MB", speed and time left */
 
 static int frame_count = 0;
-static char fw_version[COLS + 1];	/* "v0.3.1 beta", shown in the header */
+static char fw_version[COLS + 1];	/* "v0.3.2 beta", shown in the header */
 
 /* --- small helpers ------------------------------------------------------ */
 
@@ -201,7 +201,8 @@ static void* TaskDumpSave(void* arg)
 	struct sq_result r;
 	(void)arg;
 	snprintf(work_title, sizeof(work_title), "Backing up the save...");
-	sq_do_backup_save(&cart, &r);
+	work_total = cart.save_size;
+	sq_do_backup_save(&cart, Progress, NULL, &r);
 	SetResult(&r);
 	worker_busy = 0;
 	return NULL;
@@ -212,7 +213,8 @@ static void* TaskWriteSave(void* arg)
 	struct sq_result r;
 	(void)arg;
 	snprintf(work_title, sizeof(work_title), "Writing the save to the cartridge...");
-	sq_do_write_save(&cart, backups[restore_sel].path, CART_RW_CMD, &r);
+	work_total = 3 * cart.save_size;	/* backup, write, read back */
+	sq_do_write_save(&cart, backups[restore_sel].path, CART_RW_CMD, Progress, NULL, &r);
 	SetResult(&r);
 	worker_busy = 0;
 	return NULL;
@@ -223,7 +225,8 @@ static void* TaskRestore(void* arg)
 	struct sq_result r;
 	(void)arg;
 	snprintf(work_title, sizeof(work_title), "Restoring the save...");
-	sq_do_restore_save(&cart, backups[restore_sel].path, &r);
+	work_total = sq_file_size(backups[restore_sel].path);
+	sq_do_restore_save(&cart, backups[restore_sel].path, Progress, NULL, &r);
 	SetResult(&r);
 	worker_busy = 0;
 	return NULL;
@@ -293,7 +296,8 @@ static int ItemEnabled(int item)
 	case ITEM_RESTORE:
 		return cart.present;
 	case ITEM_WRITE_SAVE:
-		return cart.present && cart.save_size > 0;
+		/* Not when the slot reports write protection */
+		return cart.present && cart.save_size > 0 && sq_reader_writable() != 0;
 	default:
 		return 1;
 	}
@@ -306,7 +310,10 @@ static const char* ItemHelp(int item)
 	case ITEM_DUMP_ROM:  return "Put the game in roms/ to play without the cartridge.";
 	case ITEM_DUMP_SAVE: return "Copy the cartridge's save into saves/ on the SD card.";
 	case ITEM_RESTORE:   return "Choose which save to use with this cartridge.";
-	case ITEM_WRITE_SAVE: return "Experimental: put a save on the cartridge.";
+	case ITEM_WRITE_SAVE:
+		return cart.present && sq_reader_writable() == 0
+			? "Not available: the slot is write protected."
+			: "Experimental: put a save on the cartridge.";
 	default:             return "Return to RetroArch's menu.";
 	}
 }
@@ -442,8 +449,8 @@ static void Render(void)
 		DrawText(MARGIN, y, work_title, C_TEXT);
 		y += 2 * LINE;
 		if (work_total > 0) {
-			/* A copy: bar, "MB of MB", speed and time left, the same
-			 * words as the loading screen and the home screen */
+			/* Bar, "MB of MB" (KB for saves), speed and time left, the
+			 * same words as the loading screen and the home screen */
 			char size[COLS + 1], rate[COLS + 1];
 			int w = WIDTH - 2 * MARGIN;
 			if (meter.total != work_total)

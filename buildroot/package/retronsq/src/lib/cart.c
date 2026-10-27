@@ -308,14 +308,21 @@ static void make_room(long needed)
 	}
 }
 
+/* A read that disagrees with the slot's checksum, in launcher.log */
+static void log_mismatch(const struct sq_cart* c, uint32_t crc, uint32_t expected, int attempt)
+{
+	sq_log_sd("cartridge: %s (%s, %ld bytes) read %d: checksum %08x, the slot says %08x",
+		c->rom, c->title, c->rom_size, attempt, (unsigned)crc, (unsigned)expected);
+}
+
 int sq_cache_cartridge(const struct sq_cart* c, int* verified,
 	sq_progress_fn progress, void* ctx, struct sq_error* e)
 {
 	char src[SQ_PATH_LEN], dst[SQ_PATH_LEN], crc_path[SQ_PATH_LEN], dir[SQ_PATH_LEN];
-	uint32_t expected = 0, crc = 0;
+	uint32_t expected = 0, crc = 0, first = 0;
 	int have_crc, attempt, copied = 0;
 
-	*verified = 0;
+	*verified = SQ_UNVERIFIED;
 	if (!sq_cart_still_there(c)) {
 		sq_fail(e, 0, "the cartridge was removed or changed");
 		return -1;
@@ -335,18 +342,25 @@ int sq_cache_cartridge(const struct sq_cart* c, int* verified,
 				sq_fail(e, 0, "the cartridge was removed while it was being read");
 			continue;
 		}
-		copied = 1;
 		if (!have_crc) {
+			copied = 1;
 			sq_log("no .crc from the reader, can't verify %s", c->rom);
 			break;
 		}
-		*verified = crc == expected;
-		if (!*verified)
-			sq_log("crc mismatch for %s: read %08x, reader says %08x",
-				c->rom, crc, expected);
+		if (crc == expected)
+			*verified = SQ_VERIFIED_CRC;
+		else if (copied && crc == first)
+			*verified = SQ_VERIFIED_TWICE;	/* see sqcart.h */
+		else
+			log_mismatch(c, crc, expected, attempt + 1);
+		if (!copied)
+			first = crc;
+		copied = 1;
 	}
 	if (!copied)
 		return -1;
+	if (*verified == SQ_VERIFIED_TWICE)
+		sq_log_sd("cartridge: %s read twice with identical data; keeping it", c->rom);
 	/* Without a matching CRC only the cartridge still being there vouches
 	 * for the data: a copy that "worked" while it was pulled is dropped */
 	if (!*verified && !sq_cart_still_there(c)) {
@@ -355,7 +369,7 @@ int sq_cache_cartridge(const struct sq_cart* c, int* verified,
 		return -1;
 	}
 
-	/* A cached .crc means "verified copy" to sq_cache_valid */
+	/* A cached .crc (the slot's) means "trusted copy" to sq_cache_valid */
 	sq_cart_cache_path(c, ".crc", dst, sizeof(dst));
 	if (*verified) {
 		uint8_t b[4] = { expected >> 24, expected >> 16, expected >> 8, expected };
@@ -374,9 +388,10 @@ int sq_dump_to_library(const struct sq_cart* c, char* out, size_t len,
 {
 	char src[SQ_PATH_LEN], dir[SQ_PATH_LEN], rel[SQ_PATH_LEN], path[SQ_PATH_LEN];
 	char base[300], save_src[SQ_PATH_LEN], save_dst[SQ_PATH_LEN];
+	char seen_path[8][SQ_PATH_LEN];
 	const char* ext = strrchr(c->rom, '.');
-	uint32_t expected = 0, crc = 0;
-	int have_crc, attempt, n;
+	uint32_t expected = 0, crc = 0, first = 0, seen[8], cache_crc = 0;
+	int have_crc, attempt, n, from_cache, nseen = 0, cache_known = 0, i;
 
 	*already = *verified = *save_copied = 0;
 	if (!sq_cart_still_there(c)) {
@@ -386,9 +401,10 @@ int sq_dump_to_library(const struct sq_cart* c, char* out, size_t len,
 	sq_cart_reader_path(c, ".crc", path, sizeof(path));
 	have_crc = sq_crc_read_file(path, &expected) == 0;
 
-	/* A verified copy from an earlier play holds the same data, and reading
+	/* A trusted copy from an earlier play holds the same data, and reading
 	 * it from the SD card is much faster than from the cartridge */
-	if (sq_cache_valid(c))
+	from_cache = sq_cache_valid(c);
+	if (from_cache)
 		sq_cart_cache_path(c, NULL, src, sizeof(src));
 	else
 		sq_cart_reader_path(c, NULL, src, sizeof(src));
@@ -399,12 +415,24 @@ int sq_dump_to_library(const struct sq_cart* c, char* out, size_t len,
 	snprintf(out, len, "%s/%s", dir, c->rom);
 
 	/* Already in the library? Don't copy it twice. A different game with
-	 * the same name becomes "<name> (2)" and so on. */
+	 * the same name becomes "<name> (2)" and so on. Same game: same
+	 * checksum as the slot's, or as the trusted copy (a game whose slot
+	 * checksum never matches), or, checked after reading, as this read. */
 	for (n = 2; sq_file_size(out) >= 0; n++) {
-		if (have_crc && sq_file_size(out) == c->rom_size &&
-				sq_file_crc(out, &crc, progress, ctx, NULL) == 0 && crc == expected) {
-			*already = *verified = 1;
-			return 0;
+		if (sq_file_size(out) == c->rom_size &&
+				sq_file_crc(out, &crc, progress, ctx, NULL) == 0) {
+			if (from_cache && !cache_known) {
+				cache_known = sq_file_crc(src, &cache_crc, NULL, NULL, NULL) == 0;
+			}
+			if ((have_crc && crc == expected) || (cache_known && crc == cache_crc)) {
+				*already = 1;
+				*verified = have_crc && crc == expected ? SQ_VERIFIED_CRC : SQ_VERIFIED_TWICE;
+				return 0;
+			}
+			if (nseen < 8) {
+				seen[nseen] = crc;
+				snprintf(seen_path[nseen++], SQ_PATH_LEN, "%s", out);
+			}
 		}
 		snprintf(base, sizeof(base), "%s (%d)", c->base, n);
 		snprintf(out, len, "%s/%s%s", dir, base, ext ? ext : "");
@@ -418,14 +446,31 @@ int sq_dump_to_library(const struct sq_cart* c, char* out, size_t len,
 			unlink(out);
 			return -1;
 		}
-		*verified = !have_crc || crc == expected;
+		if (!have_crc || crc == expected)
+			*verified = SQ_VERIFIED_CRC;
+		else if (from_cache || (attempt > 0 && crc == first))
+			*verified = SQ_VERIFIED_TWICE;	/* the trusted copy, or read twice */
+		else
+			log_mismatch(c, crc, expected, attempt + 1);
+		first = crc;
 	}
+	if (*verified == SQ_VERIFIED_TWICE && !from_cache)
+		sq_log_sd("cartridge: %s read twice with identical data; keeping it", c->rom);
 	/* As in sq_cache_cartridge: unverified data from a cartridge that is
 	 * gone now isn't kept */
 	if ((!have_crc || !*verified) && !sq_cart_still_there(c)) {
 		unlink(out);
 		sq_fail(e, 0, "the cartridge was removed while it was being read");
 		return -1;
+	}
+	/* The same data under the game's name already: keep that one */
+	for (i = 0; *verified && i < nseen; i++) {
+		if (seen[i] == crc) {
+			unlink(out);
+			snprintf(out, len, "%s", seen_path[i]);
+			*already = 1;
+			return 0;
+		}
 	}
 
 	/* Bring the save along: the live save from playing the cartridge, else

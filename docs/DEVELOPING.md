@@ -238,9 +238,13 @@ behaviour.
 
 Put the action itself in `src/lib/actions.c` (`sq_do_*`: the steps and the
 lines shown to the user), so the home screen's Cartridge page and the
-RetroArch tools core both get it. Then add it to both front ends: in
-`src/home/home.c`, `enum cart_item`, `cart_label[]`, `cart_help[]`,
-`cart_item_enabled`, `activate` and a `TASK_*`; and in `src/tools/sqtools.c`:
+RetroArch tools core both get it. Give it a `sq_progress_fn` and say in
+`sqcart.h` what it counts up to, so the screens can show a meter. Then add
+it to both front ends: in `src/home/home.c`, `enum cart_item`,
+`cart_label[]`, `cart_help[]`, `cart_item_enabled` (and why it's greyed out
+in `cart_item_help`), `activate`, a `TASK_*` and its total in `start_task`
+(and a step in `work_phase` if it has several); and in
+`src/tools/sqtools.c`:
 
 1. Add an `ITEM_*` to `enum item` and its label to `item_label[]`.
 2. Say when it's available in `ItemEnabled()` and what it does in
