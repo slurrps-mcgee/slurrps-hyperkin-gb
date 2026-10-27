@@ -249,11 +249,28 @@ Details:
 small SDL2 program, built to be light on the RK3128:
 
 - **Draws only when something changed** and otherwise sleeps in
-  `SDL_WaitEventTimeout`, waking twice a second to rescan the cartridge
-  (`sq_cart_scan`: `/proc/mounts` and two sysfs files). No animation loop.
+  `SDL_WaitEventTimeout`. No animation loop.
+- **Vsync, each frame waited for.** Without vsync, SDL 2.0.12's KMSDRM
+  driver queues page flips but never reads the "flip done" events; they
+  fill the DRM file's 4 KB event space (`drm_fops.c`) after about 128
+  frames, and from then on every flip fails: the screen froze while the
+  program ran on (v0.3.0–v0.3.2, "the UI freezes"). Frames presented while
+  a flip was pending were dropped too ("shows only when another frame
+  follows"). sqhome and sqload now create their renderer with
+  `SDL_RENDERER_PRESENTVSYNC` and set `SDL_VIDEO_DOUBLE_BUFFER=1`, so each
+  present waits for its own flip and reads its event.
+- **Nothing slow on the main thread.** A poller thread looks at the slot
+  twice a second (`sq_cart_scan`, the reader state, write protection, what
+  writing to the cartridge did, the `.crc`, and a pending write check, which
+  reads the cartridge's save) and wakes the main loop with an SDL event
+  when something changed. Settings are saved by a saver thread (quick
+  changes coalesce; leaving the home screen waits for it), so a button
+  never waits for the SD card. Favorites are kept in memory.
 - **Text is cached:** every rendered string is kept as a texture (128
-  entries, least recently used dropped). FreeType runs only when a new
-  string appears.
+  entries, least recently used dropped), keyed by the width it was fitted
+  to, so a hit costs no FreeType call at all (not even measuring).
+- **Slow moments are logged:** a button or a frame that takes over 250 ms
+  goes to `launcher.log` ("home: slow: ..."), up to 20 times per run.
 - **Box art loads lazily:** only for the selected game, 150 ms after the
   cursor stops, one image held at a time (`sq_boxart_path`). First a PNG
   next to the game with its name (`roms/gba/Golden Sun.png`), else
@@ -321,8 +338,24 @@ loading screen and the tools core use too), and the writes also the step
 they're on (backing up, writing, reading back). A failed action goes
 straight to its message instead of a moment of "Done". On the right, the
 cartridge's details: from the scan, the slot's `.crc` (read once per
-cartridge), and `sq_reader_writable()`. Write options are greyed out when
-the slot reports write protection, with the reason under the list.
+cartridge), `sq_reader_writable()` and `sq_cart_write_known()`. The slot's
+write protection can only say "no": a slot that doesn't report it may
+still not pass writes on. So what writing a save and writing a game did is
+recorded per cartridge (ROM file name and size) in `home/cart-writes.txt`
+when it is known: by the re-insert write check, or by a write that read
+back different. The details say *Not tested yet*, *Works (tested)* or
+*Doesn't stick (tested)*, and a write option is greyed out, with the reason
+under the list, when the slot is write protected or that kind of write
+already didn't stick.
+
+**Date and time.** The console has no battery-backed clock, so every boot
+started in 1970 and files were dated so. `sqcart clock-restore` (at the
+end of `S21mountall.sh`, after userdata is mounted) sets the clock to the
+time saved in `home/clock`, or to the firmware's build time
+(`/etc/retronsq-version`'s date) if later. sq-session's `ClockKeeper` saves
+the time every 5 minutes, and before a restart or power off from the home
+screen. Settings > *Date and time* sets it (`settimeofday`, then saves). The
+clock runs in UTC; a power-off loses the time it was off.
 
 **Reading cartridge...** The cartridge poll (twice a second) also looks at
 `sq_reader_state()`: while it is `pending` (the slot is on USB with a
@@ -642,19 +675,27 @@ The rules:
   cartridge save of an implausible size is still imported (so the game has
   its save) but logged as a warning, and a truncated Gen 3 Pokémon save is
   flagged.
-- **Every insert:** `sq_backup_cart_save` compares the cartridge's save with
-  every backup in `saves/<game>/`. If none is identical, it stores a new
-  `NNN-cartridge.sav`, numbered after the highest existing one. Each
-  distinct save a cartridge ever had is kept, for example after playing it
-  on another console.
+- **Every play:** `sq_sync_cart_save` (`sqcart sync-save`, in
+  `PrepareCart`) makes `saves/<game>/cartridge.sav` a copy of the
+  cartridge's save, rewriting it only when it differs, and deletes backups
+  that are byte-identical to an older backup (left by v0.2–v0.3.2, which
+  backed up on every insert; the oldest copy stays).
+- **Backups** (`NNN-<kind>.sav`, `sq_backup_store`, never stored twice) are
+  made when the user asks (*Back up cartridge save*: `cartridge`) and
+  before the firmware overwrites a save: a restore (`before-restore`) or a
+  write to the cartridge (`before-write`).
 - **Going back to the cartridge's save, or an older one:** Cartridge Tools →
   *Restore a save...*. It backs up the live save, then replaces it.
 - **Writes are atomic.** Everything the firmware writes goes to a temporary
-  file that is fsynced and renamed when complete. RetroArch 1.7.4 itself
-  truncated the `.srm` and rewrote it in place without fsync, so a power
-  cut during a save could destroy it; the firmware's RetroArch patch
+  file that is fsynced and renamed when complete, and then the folder is
+  fsynced (`sq_write_atomic`, `sq_sync_dir`). That last step matters on the
+  FAT card: a rename otherwise stays in memory for up to 30 s (the kernel's
+  dirty writeback), and a console switched off in that time comes back with
+  the old file; that is how settings were lost up to v0.3.2. RetroArch 1.7.4
+  itself truncated the `.srm` and rewrote it in place without fsync, so a
+  power cut during a save could destroy it; the firmware's RetroArch patch
   `0003-tasks-write-save-RAM-atomically.patch` makes its autosave and its
-  save-on-exit write `<save>.tmp`, fsync and rename too.
+  save-on-exit write `<save>.tmp`, fsync, rename and fsync the folder too.
 - **Autosave every 2 s.** `autosave_interval = 2` (in
   `retroarch-cfw.cfg`): an in-game save reaches the SD card within about
   2 seconds, so switching the console off soon after saving keeps it. Only
@@ -759,13 +800,13 @@ browsed through *Start directory* use whatever core you pick there.
 
 The firmware version lives in the `VERSION` file at the top of the tree
 (`RETRONSQ_VERSION` in the environment overrides it; the release workflow
-sets it). While the major version is 0, " beta" is added: `0.3.2` is shown as
-**v0.3.2 beta**.
+sets it). While the major version is 0, " beta" is added: `0.3.3` is shown as
+**v0.3.3 beta**.
 
 A Buildroot finalize hook in `retronsq.mk` (`RETRONSQ_INSTALL_VERSION`)
 runs on every build:
 
-- writes `/etc/retronsq-version` ("Retron SQ CFW v0.3.2 beta"), printed at
+- writes `/etc/retronsq-version` ("Retron SQ CFW v0.3.3 beta"), printed at
   boot and shown by the home screen and Cartridge Tools;
 - fills `@VERSION_LABEL@` into the two SVG templates in
   `buildroot/package/retronsq/splash/` and renders them with `rsvg-convert`
@@ -806,17 +847,24 @@ every card. On first boot `S21mountall.sh` does:
    GUID and name, ending at the end of the card. `partx` tells the kernel
    the new size; if that fails, the console reboots once. Every step logs
    what it found and why it stopped ("grow: ..." lines in `logs/boot.log`).
-2. **`resize_fat`.** If the FAT32 filesystem is smaller than its partition
-   (it reads the size from the boot sector with `hexdump`: the console's
-   BusyBox `od` has no offset options, which kept v0.1–v0.2.1 from ever
-   expanding it), `expand_fat` backs up the
-   contents (only factory files at this point, under 32 MiB) to RAM,
-   formats the whole partition FAT32 and restores them. A partition holding
-   more than 32 MiB is never touched. A completely blank partition is
-   formatted. Anything else unreadable is left alone.
+2. **`resize_fat`.** If the FAT32 filesystem is more than 16 MiB smaller
+   than its partition (it reads the size from the boot sector with
+   `hexdump`: the console's BusyBox `od` has no offset options, which kept
+   v0.1–v0.2.1 from ever expanding it) and is no bigger than 256 MiB (the
+   image's is 64 MiB; a bigger FAT was made on a PC and is never rebuilt),
+   `expand_fat` runs `fsck.fat -a`, copies its files to RAM (`tar` into
+   `/tmp`, only if they fit with 8 MiB to spare), formats the whole
+   partition FAT32 and puts them back, logging how many files and folders
+   came back. A completely blank partition is formatted. Anything else
+   unreadable is left alone. Up to v0.3.2 a filesystem holding more than
+   32 MiB was never expanded: a card with games copied on before its first
+   boot, or with a cartridge copy, stayed at 64 MiB.
 
-There is no reliable in-place FAT resizer, which is why it reformats. That's
-safe here because it only ever happens on a fresh card.
+There is no reliable in-place FAT resizer, which is why it rebuilds. The
+`grow` tests run the real `expand_fat` (the console's BusyBox, the real
+`mkfs.fat`; mount and umount moved onto mtools) on a 64 MiB image holding
+40 MB of files, in 128 and 512 MiB partitions, and check every file comes
+back unchanged.
 
 Rockchip's `61-sd-cards-auto-mount.rules` (mount any FAT partition of an
 SD card at `/mnt/sdcard`) is not installed: the console's only SD card is

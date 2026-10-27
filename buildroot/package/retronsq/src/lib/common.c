@@ -10,6 +10,8 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "sqcart.h"
@@ -224,7 +226,29 @@ int sq_write_atomic(const char* path, const void* data, long size, struct sq_err
 		unlink(tmp);
 		return -1;
 	}
+	sq_sync_dir(path);
 	return 0;
+}
+
+void sq_sync_dir(const char* path)
+{
+	char dir[SQ_PATH_LEN];
+	char* slash;
+	int fd;
+
+	snprintf(dir, sizeof(dir), "%s", path);
+	slash = strrchr(dir, '/');
+	if (slash == dir)
+		slash[1] = '\0';
+	else if (slash)
+		*slash = '\0';
+	else
+		snprintf(dir, sizeof(dir), ".");
+	fd = open(dir, O_RDONLY | O_DIRECTORY);
+	if (fd >= 0) {
+		fsync(fd);
+		close(fd);
+	}
 }
 
 int sq_same_content(const char* path, const void* data, long size)
@@ -234,4 +258,48 @@ int sq_same_content(const char* path, const void* data, long size)
 	int same = other && len == size && memcmp(other, data, size) == 0;
 	free(other);
 	return same;
+}
+
+/* --- the clock ----------------------------------------------------------- */
+
+#define CLOCK_FILE	SQ_HOME_DIR "/clock"
+#define BUILD_STAMP	"/etc/retronsq-version"	/* written when the firmware is built */
+
+int sq_clock_save(void)
+{
+	char path[SQ_PATH_LEN], text[32];
+	int n = snprintf(text, sizeof(text), "%ld\n", (long)time(NULL));
+	sq_mkdirs(sq_path(path, sizeof(path), SQ_HOME_DIR));
+	return sq_write_atomic(sq_path(path, sizeof(path), CLOCK_FILE), text, n, NULL);
+}
+
+long sq_clock_wanted(void)
+{
+	char path[SQ_PATH_LEN];
+	struct stat st;
+	long saved = 0, built = 0, want;
+	FILE* fp = fopen(sq_path(path, sizeof(path), CLOCK_FILE), "r");
+
+	if (fp) {
+		if (fscanf(fp, "%ld", &saved) != 1)
+			saved = 0;
+		fclose(fp);
+	}
+	if (stat(sq_path(path, sizeof(path), BUILD_STAMP), &st) == 0)
+		built = (long)st.st_mtime;
+	want = saved > built ? saved : built;
+	return want > (long)time(NULL) ? want : 0;
+}
+
+int sq_clock_set(long t, struct sq_error* e)
+{
+	struct timeval tv;
+	tv.tv_sec = t;
+	tv.tv_usec = 0;
+	if (settimeofday(&tv, NULL) != 0) {
+		sq_fail(e, errno, "setting the clock");
+		return -1;
+	}
+	sq_clock_save();
+	return 0;
 }

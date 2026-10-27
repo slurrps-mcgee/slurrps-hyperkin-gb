@@ -55,7 +55,7 @@ endef
 
 # Firmware version: RETRONSQ_VERSION from the environment (the release
 # workflow sets it), else the VERSION file at the top of the tree. While the
-# major version is 0 the screens say "v0.3.2 beta".
+# major version is 0 the screens say "v0.3.3 beta".
 RETRONSQ_VERSION ?= $(shell cat $(TOPDIR)/../VERSION 2>/dev/null)
 RETRONSQ_VERSION_LABEL = v$(RETRONSQ_VERSION)$(if $(filter 0.%,$(RETRONSQ_VERSION)), beta)
 

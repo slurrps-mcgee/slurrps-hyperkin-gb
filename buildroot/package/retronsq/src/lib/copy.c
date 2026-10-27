@@ -218,6 +218,7 @@ int sq_copy(const char* src, const char* dst, uint32_t* crc,
 		unlink(part);
 		return -1;
 	}
+	sq_sync_dir(dst);
 	if (crc)
 		*crc = sum;
 	return 0;

@@ -49,7 +49,7 @@
 #ifndef CART_RW_CMD
 #define CART_RW_CMD	"/usr/lib/retronsq/cart-event"
 #endif
-#define VERSION_FILE	"/etc/retronsq-version"		/* "Retron SQ CFW v0.3.2 beta" */
+#define VERSION_FILE	"/etc/retronsq-version"		/* "Retron SQ CFW v0.3.3 beta" */
 
 /* Leave RetroArch so sq-session takes over. SIGTERM makes RetroArch exit
  * cleanly (saving), like sq-session's own stop. Tests replace it. */
@@ -123,7 +123,7 @@ static char work_title[COLS + 1];
 static struct sq_meter meter;		/* "MB of MB", speed and time left */
 
 static int frame_count = 0;
-static char fw_version[COLS + 1];	/* "v0.3.2 beta", shown in the header */
+static char fw_version[COLS + 1];	/* "v0.3.3 beta", shown in the header */
 
 /* --- small helpers ------------------------------------------------------ */
 
@@ -296,8 +296,10 @@ static int ItemEnabled(int item)
 	case ITEM_RESTORE:
 		return cart.present;
 	case ITEM_WRITE_SAVE:
-		/* Not when the slot reports write protection */
-		return cart.present && cart.save_size > 0 && sq_reader_writable() != 0;
+		/* Not when the slot reports write protection, or a save written
+		 * to this cartridge before didn't stick */
+		return cart.present && cart.save_size > 0 && sq_reader_writable() != 0 &&
+			sq_cart_write_known(&cart, 0) != 0;
 	default:
 		return 1;
 	}
@@ -311,9 +313,11 @@ static const char* ItemHelp(int item)
 	case ITEM_DUMP_SAVE: return "Copy the cartridge's save into saves/ on the SD card.";
 	case ITEM_RESTORE:   return "Choose which save to use with this cartridge.";
 	case ITEM_WRITE_SAVE:
-		return cart.present && sq_reader_writable() == 0
-			? "Not available: the slot is write protected."
-			: "Experimental: put a save on the cartridge.";
+		if (cart.present && sq_reader_writable() == 0)
+			return "Not available: the slot is write protected.";
+		if (cart.present && sq_cart_write_known(&cart, 0) == 0)
+			return "Not available: a write didn't stick before.";
+		return "Experimental: put a save on the cartridge.";
 	default:             return "Return to RetroArch's menu.";
 	}
 }

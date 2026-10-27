@@ -372,7 +372,7 @@ static void scan_srm(const char* dir, int depth, int cartridge, struct save_scan
 			*dot = '\0';
 		if (cartridge) {
 			spaces(f->label);
-			snprintf(f->kind, sizeof(f->kind), "Cartridge save");
+			snprintf(f->kind, sizeof(f->kind), "Save for playing the cartridge");
 		} else if (strstr(path, "/gba/")) {
 			snprintf(f->kind, sizeof(f->kind), "Game Boy Advance save");
 		} else if (strstr(path, "/gbc/")) {
@@ -396,13 +396,15 @@ static int compare_saves(const void* a, const void* b)
 	if (c)
 		return c;
 	if (x->live != y->live)
-		return y->live - x->live;	/* the live save, then its backups */
-	return y->backup - x->backup;		/* newest backup first */
+		return y->live - x->live;	/* the live save, */
+	if (x->copy != y->copy)
+		return y->copy - x->copy;	/* the cartridge's copy, */
+	return y->backup - x->backup;		/* then backups, newest first */
 }
 
 int sq_saves_scan(struct sq_save_file** out)
 {
-	char dir[SQ_PATH_LEN], label[128];
+	char dir[SQ_PATH_LEN], label[128], path[SQ_PATH_LEN];
 	struct save_scan s = { NULL, 0, 0 };
 	struct sq_backup list[64];
 	struct dirent* d;
@@ -420,6 +422,17 @@ int sq_saves_scan(struct sq_save_file** out)
 		n = sq_backup_list(d->d_name, list, 64);
 		snprintf(label, sizeof(label), "%s", d->d_name);
 		spaces(label);
+		/* The copy of the cartridge's own save */
+		sq_cart_save_copy_path(d->d_name, path, sizeof(path));
+		if (sq_file_size(path) >= 0) {
+			struct sq_save_file* f = add_save(&s);
+			if (f) {
+				snprintf(f->label, sizeof(f->label), "%s", label);
+				snprintf(f->kind, sizeof(f->kind), "Copy of the cartridge's save");
+				f->copy = 1;
+				save_stat(f, path);
+			}
+		}
 		for (i = 0; i < n; i++) {
 			struct sq_save_file* f = add_save(&s);
 			char* p;

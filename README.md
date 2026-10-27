@@ -1,6 +1,6 @@
 # Retron SQ Custom Firmware
 
-**v0.3.2 beta**: custom firmware for the Hyperkin Retron SQ. Play Game Boy,
+**v0.3.3 beta**: custom firmware for the Hyperkin Retron SQ. Play Game Boy,
 Game Boy Color and Game Boy Advance cartridges as before, or ROMs from the SD
 card with no cartridge at all, from a simple home screen, with the full
 RetroArch menu on Start + Select in any game.
@@ -18,6 +18,18 @@ Changing or extending it: [docs/DEVELOPING.md](docs/DEVELOPING.md).
 > works and what doesn't.
 
 ## What's new
+
+**In v0.3.3:**
+
+| | |
+| --- | --- |
+| **No more frozen screen** | The home screen and the loading screen could stop updating after a few dozen button presses (and react late before that). Fixed at the cause: frames are now synced to the display (vsync). |
+| **Settings and saves survive switching off** | Settings, and saves written by games, could come back as they were if the console was switched off within about 30 seconds. Every save now reaches the SD card completely before it counts as done. |
+| **The SD card really fills the card** | The RETRONSQ drive stayed at 64 MB when it already held more than 32 MB of files (games copied on before the first boot, cartridge copies). It now grows whatever it holds, keeping every file. |
+| **Dates on saves** | The console has no clock battery, so files were dated 1970. It now keeps the time: set it once in Settings → *Date and time*; it carries on from the last saved time after a power-off. |
+| **One copy of the cartridge's save** | `saves/<game>/cartridge.sav` mirrors the cartridge's save; numbered backups are only made when you ask or before something is overwritten. Old duplicate backups are cleaned up. |
+| **Writable, as tested** | Writing options are greyed out (with the reason) when the slot is write protected, or when a write to that cartridge already didn't stick. Otherwise it says *Not tested yet* until a write is checked. |
+| **Smoother home screen** | The cartridge slot is watched in the background, settings are saved in the background, and text is drawn from a cache, so nothing waits on the SD card or the slot. |
 
 **In v0.3.2:**
 
@@ -96,16 +108,22 @@ froze on start in both. Use v0.2.2 or later.
 2. Write the `.img` to the console's microSD card with a USB card reader:
    - **Fedora/GNOME:** open *Disks*, select the card, ⋮ → *Restore Disk Image…*
    - **Any OS:** balenaEtcher (or Rufus on Windows)
-   - **Terminal:** `sudo dd if=RetronSQ-CFW-v0.3.2-sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress`
+   - **Terminal:** `sudo dd if=RetronSQ-CFW-v0.3.3-sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress`
      (find `/dev/sdX` with `lsblk` first; it gets overwritten)
 3. Put the card in the console and switch it on.
 
 **The first boot finishes the installation.** Right after writing, the card's
 games partition is only about 65 MB, and the rest shows as unallocated on a
 PC. That's expected. On its first boot the console grows the partition to the
-end of the card (any size up to 128 GB), formats it FAT32 and may restart once
-by itself. After that, the card shows up on a PC as **RETRONSQ** with its full
-size.
+end of the card (any size up to 128 GB), rebuilds the RETRONSQ drive at the
+new size (keeping any files already on it, such as games you copied on
+before switching on) and may restart once by itself. After that, the card
+shows up on a PC as **RETRONSQ** with its full size.
+
+**A card stuck at 64 MB** (v0.3.2 or older, see *What's new*): a fresh image
+of this version grows it on its first boot. Writing an image replaces
+everything on the card, so copy your files off the RETRONSQ drive first
+(saves, `retronsq.cfg`, games) and back on afterwards.
 
 If the RETRONSQ drive is still small after the console has booted, open
 `logs/boot.log` on it: it says what the first boot found and did. Please
@@ -272,6 +290,7 @@ it leaves the console's CPU idle.
 | **Wait for a cartridge at power-on** | How long the splash waits for a cartridge before the home screen shows |
 | **Game Boy Advance / Color / Game Boy emulator** | The core for each system: gpSP, mGBA, VBA-M, or any core in `retroarch/cores` |
 | **Start screen** | *Home*, or *RetroArch menu* to start in RetroArch's own menu as in v0.2 |
+| **Date and time** | Set the clock (Left/Right pick, Up/Down change, A sets). There's no clock battery: the time is saved every 5 minutes and before restarting or powering off, and after a power-off it carries on from the last saved time |
 | **RetroArch settings** | RetroArch's full menu, for video, audio, shaders, controls... |
 | **About**, **Restart**, **Power off** | |
 
@@ -291,11 +310,17 @@ The home screen uses RetroArch's own controller profiles
 ![Cartridge page](docs/images/home-cartridge.png)
 
 On the home screen's **Cartridge** page, with what the cartridge is on the
-right: system, game code, size, save type, whether it's writable, and the
-slot's checksum. While the slot is still reading a cartridge, the top right
+right: system, game code, size, save type, whether writing a save or a game
+to it works, and the slot's checksum. While the slot is still reading a cartridge, the top right
 of the screen says *Reading cartridge...*. (With *Start screen* set to
 *RetroArch menu*, the same tools, except writing a game, are under **Load
 Content → Collections → Cartridge Tools**.)
+
+Whether a cartridge takes writes can only be found out by trying: the slot
+reports write protection, but a slot that doesn't may still not pass writes
+on to the cartridge. So the details say *Not tested yet* until a write is
+checked (by taking the cartridge out and putting it back in), then *Works
+(tested)* or *Doesn't stick (tested)*.
 
 Options that can't work on this cartridge are greyed out, and the line
 under them says why: writing when the slot reports the cartridge as write
@@ -340,17 +365,22 @@ when you ask for it.
 
 - The first time a cartridge is played, its save is copied to the SD card
   (`rom/<game>.srm`). From then on every save goes there.
-- Each time a cartridge is inserted, its save is backed up to
-  `saves/<game>/` (`001-cartridge.sav`, `002-cartridge.sav`...) if it differs
-  from the backups already there. If you play the cartridge on a real Game
-  Boy in between, nothing is lost.
+- Each time a cartridge is played, `saves/<game>/cartridge.sav` is made a
+  copy of the save on the cartridge.
+- Backups (`saves/<game>/001-cartridge.sav`, `002-before-restore.sav`...)
+  are only made when you ask (**Back up cartridge save**) and before the
+  console overwrites a save: restoring another one (`before-restore`), or
+  writing one to the cartridge (`before-write`). An identical backup is never
+  stored twice, and duplicates left by older versions are removed.
 - To go back to the save on the cartridge, use **Cartridge → Restore a
   save... → Save on the cartridge now**.
 - The **Saves** page on the home screen lists them all, and can delete a
   save or a backup you no longer want.
 - In-game saves are written to the SD card within about 2 seconds, in a way
   that a power cut can't corrupt (the old save stays until the new one is
-  complete). Still, give it a few seconds after saving before switching off.
+  complete, and the new one is flushed to the card before it replaces it).
+  Still, give it a few seconds after saving before switching off.
+- Files get the console's date and time (see *Date and time* in Settings).
 
 ### Writing a save to the cartridge (experimental)
 
@@ -360,7 +390,8 @@ you play with now* or a backup, and confirm twice (move to *Yes* / *Write
 it* and press A; *No* is always the default).
 
 - **Before writing**, the cartridge's current save is backed up to
-  `saves/<game>/`, so you can always get it back (*Restore a save...*).
+  `saves/<game>/` (`NNN-before-write.sav`), so you can always get it back
+  (*Restore a save...*).
 - **Refused, with nothing changed**, when: the cartridge slot reports the
   cartridge as write-protected, the save is a different size from the
   cartridge's, or it's a Pokémon Ruby/Sapphire/Emerald/FireRed/LeafGreen

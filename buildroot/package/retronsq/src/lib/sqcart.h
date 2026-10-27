@@ -93,10 +93,31 @@ unsigned char* sq_read_all(const char* path, long max, long* size);
 /* Same, reporting base + bytes read so far to progress (may be NULL) */
 unsigned char* sq_read_all_progress(const char* path, long max, long* size,
 	sq_progress_fn progress, void* ctx, long base);
-/* Write via path.tmp + fsync + rename, so a power cut leaves old or new */
+/* Write via path.tmp + fsync + rename + fsync of the folder, so a power
+ * cut leaves the old file or the new one. The folder's fsync matters: on
+ * the FAT card the rename otherwise sits in memory for up to 30 s, and the
+ * console is switched off at the power. */
 int sq_write_atomic(const char* path, const void* data, long size, struct sq_error* e);
+/* Flush the folder holding path (its renames and new files) to the card */
+void sq_sync_dir(const char* path);
 /* True when the file holds exactly data */
 int sq_same_content(const char* path, const void* data, long size);
+
+/* --- the clock ------------------------------------------------------------ */
+
+/*
+ * The console has no battery-backed clock: every boot starts in 1970, and
+ * files (saves) got dates like that. So the time is saved on the SD card
+ * (SQ_HOME_DIR/clock) every few minutes and before a restart or power off,
+ * and at boot the clock is set to that, or to when the firmware was built
+ * if that is later. Set once on the home screen (Settings > Date and
+ * time), it then keeps roughly right, only losing the time it was off.
+ */
+int sq_clock_save(void);
+/* The time to set at boot, or 0 when the clock is already later */
+long sq_clock_wanted(void);
+/* Set the clock (needs root) and save it. 0 on success. */
+int sq_clock_set(long t, struct sq_error* e);
 
 /* --- the reader's CRC (crc.c) ------------------------------------------- */
 
@@ -206,6 +227,19 @@ int sq_dump_to_library(const struct sq_cart* c, char* out, size_t len,
  */
 int sq_import_save(const struct sq_cart* c, struct sq_error* e);
 
+/*
+ * Each game's folder in SQ_SAVES_DIR holds a copy of the cartridge's own
+ * save, cartridge.sav, refreshed whenever the cartridge is played, and
+ * backups (NNN-<kind>.sav) made when asked for or before something is
+ * overwritten.
+ */
+#define SQ_CART_SAVE_COPY "cartridge.sav"
+void sq_cart_save_copy_path(const char* game, char* out, size_t len);
+/* Make cartridge.sav match the cartridge's save (*changed when it was
+ * written), and drop backups identical to an older backup. 0 on success
+ * (or when the cartridge has no save). */
+int sq_sync_cart_save(const struct sq_cart* c, int* changed, struct sq_error* e);
+
 /* A backup in SQ_SAVES_DIR/<game>/ */
 struct sq_backup {
 	int number;		/* NNN */
@@ -221,6 +255,9 @@ int sq_backup_store(const char* game, const void* data, long size,
 /* Back up the cartridge's own save (if it has one); same return. Reading
  * it is reported to progress as base + bytes read (up to c->save_size). */
 int sq_backup_cart_save(const struct sq_cart* c, int* existed,
+	sq_progress_fn progress, void* ctx, long base, struct sq_error* e);
+/* The same as NNN-<kind>.sav ("before-write"...) */
+int sq_backup_cart_save_as(const struct sq_cart* c, const char* kind, int* existed,
 	sq_progress_fn progress, void* ctx, long base, struct sq_error* e);
 /* List a game's backups, newest first; returns how many (at most max) */
 int sq_backup_list(const char* game, struct sq_backup* out, int max);
@@ -241,8 +278,19 @@ int sq_restore_save(const struct sq_cart* c, const char* path,
  */
 
 /* Whether the reader accepts writes, as its drive reported when it was
- * mounted (cart-event records it): 1 yes, 0 write-protected, -1 unknown */
+ * mounted (cart-event records it): 1 yes, 0 write-protected, -1 unknown.
+ * Only "0" means much: a slot that doesn't report write protection may
+ * still not pass writes on to the cartridge. */
 int sq_reader_writable(void);
+
+/*
+ * What writing to this cartridge (same ROM file name and size) did when it
+ * was tried: 1 it worked (confirmed when the cartridge was put back), 0 it
+ * didn't stick, -1 not tried yet. game: 1 for writing a game, 0 a save.
+ * Recorded by the write check and by a write that read back different.
+ */
+int sq_cart_write_known(const struct sq_cart* c, int game);
+void sq_cart_write_record(const struct sq_cart* c, int game, int ok);
 
 /*
  * Write data over the cartridge's save file, in place: same size, no
@@ -371,15 +419,18 @@ char* sq_boxart_path(const struct sq_game* g, char* out, size_t len);
 struct sq_save_file {
 	char path[SQ_PATH_LEN];	/* on the console: /userdata/... */
 	char label[128];	/* the game */
-	char kind[48];		/* "Game Boy Advance save", "Cartridge save",
+	char kind[48];		/* "Game Boy Advance save", "Save for playing the
+				 * cartridge", "Copy of the cartridge's save",
 				 * "Backup #2 (cartridge)" */
 	long size;
 	long mtime;
 	int live;		/* the save a game plays with */
+	int copy;		/* saves/<game>/cartridge.sav */
 	int backup;		/* a backup's number, else 0 */
 };
-/* Every save, by game (ignoring case), the live save before its backups,
- * newest backup first. *out is malloc'ed; returns how many. */
+/* Every save, by game (ignoring case): the live save, the copy of the
+ * cartridge's save, then backups newest first. *out is malloc'ed; returns
+ * how many. */
 int sq_saves_scan(struct sq_save_file** out);
 
 /* Delete a game: a .gba/.gbc/.gb/.zip in SQ_ROMS_DIR, or a cartridge copy in

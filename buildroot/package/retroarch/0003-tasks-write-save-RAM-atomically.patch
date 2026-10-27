@@ -4,23 +4,28 @@ Subject: [PATCH] tasks: write save RAM atomically
 RetroArch truncates the .srm and writes it in place without fsync, both
 from the autosave thread and when content is closed. On a console that is
 switched off at the power, a cut during that write destroys the save.
-Write <save>.tmp, fsync it, then rename it over the save.
+Write <save>.tmp, fsync it, rename it over the save, then fsync the
+folder so the rename itself reaches the card (on FAT it otherwise stays in
+memory for up to 30 s).
 
 Signed-off-by: Retron SQ CFW
 ---
---- a/tasks/task_save.c	2026-10-26 19:23:07.165448618 -0400
-+++ b/tasks/task_save.c	2026-10-26 19:23:23.723688682 -0400
-@@ -54,6 +54,36 @@
+--- a/tasks/task_save.c	2026-10-27 17:47:39.296265952 +0000
++++ b/tasks/task_save.c	2026-10-27 17:47:39.287780902 +0000
+@@ -54,6 +54,52 @@
  #include "tasks_internal.h"
  #include "../managers/cheat_manager.h"
  
 +#if defined(__unix__)
 +#include <stdio.h>
++#include <fcntl.h>
 +/*
 + * Retron SQ: write save RAM so a power cut leaves either the old file or
 + * the new one, never a truncated one. RetroArch used to truncate the .srm
 + * and write it in place, without fsync; on a console that is switched off
-+ * at the power that can destroy a save. Write <path>.tmp, fsync, rename.
++ * at the power that can destroy a save. Write <path>.tmp, fsync, rename,
++ * then fsync the folder: on the FAT card the rename otherwise stays in
++ * memory for up to 30 s, and a cut in that time brings back the old save.
 + */
 +static bool sram_write_atomic(const char *path, const void *data, size_t size)
 +{
@@ -40,6 +45,19 @@ Signed-off-by: Retron SQ CFW
 +      ok = rename(tmp, path) == 0;
 +   if (!ok)
 +      remove(tmp);
++   else
++   {
++      char dir[PATH_MAX_LENGTH];
++      int fd;
++      strlcpy(dir, path, sizeof(dir));
++      path_basedir(dir);
++      fd = open(dir, O_RDONLY);
++      if (fd >= 0)
++      {
++         fsync(fd);
++         close(fd);
++      }
++   }
 +   return ok;
 +}
 +#endif
@@ -47,7 +65,7 @@ Signed-off-by: Retron SQ CFW
  #define SAVE_STATE_CHUNK 4096
  
  static struct string_list *task_save_files = NULL;
-@@ -158,6 +188,18 @@
+@@ -158,6 +204,18 @@
  
        if (differ)
        {
@@ -66,7 +84,7 @@ Signed-off-by: Retron SQ CFW
           /* Should probably deal with this more elegantly. */
           intfstream_t *file = intfstream_open_file(save->path,
                 RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_NONE);
-@@ -183,6 +225,7 @@
+@@ -183,6 +241,7 @@
              if (failed)
                 RARCH_WARN("Failed to autosave SRAM. Disk might be full.\n");
           }
@@ -74,7 +92,7 @@ Signed-off-by: Retron SQ CFW
        }
  
        slock_lock(save->cond_lock);
-@@ -1458,8 +1501,12 @@
+@@ -1458,8 +1517,12 @@
           msg_hash_to_str(MSG_TO),
           ram.path);
  

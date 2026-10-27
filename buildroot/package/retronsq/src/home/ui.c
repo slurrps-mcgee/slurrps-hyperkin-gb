@@ -30,7 +30,8 @@ struct cached {
 	int w, h;
 	enum font font;
 	unsigned color;
-	char text[TEXT_MAX];
+	int max_w;		/* the width it was fitted to, 0: none */
+	char text[TEXT_MAX];	/* the string asked for (before fitting) */
 	Uint32 used;
 };
 static struct cached cache[CACHE_SIZE];
@@ -55,6 +56,18 @@ int ui_open(void)
 
 	/* Rockchip's SDL picks the HDMI output with this (like sqload) */
 	setenv("SDL_MONITOR_INDEX", "1", 0);
+	/*
+	 * Vsync, with each frame waited for. Without vsync, SDL 2.0.12's KMSDRM
+	 * driver queues every page flip but never reads the "flip done" events
+	 * the kernel sends back; they pile up in the display device's 4 KB event
+	 * buffer, and once it is full (about 128 frames) every flip fails: the
+	 * screen stops changing while the program runs on. Frames presented
+	 * while a flip was pending were silently dropped too (the "frame shows
+	 * only when another follows" effect). With vsync SDL waits for each flip
+	 * and reads its event; double buffering makes it wait for the frame
+	 * just presented, so it is on screen when ui_present returns.
+	 */
+	SDL_SetHint("SDL_VIDEO_DOUBLE_BUFFER", "1");	/* SDL_HINT_VIDEO_DOUBLE_BUFFER */
 	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_JOYSTICK) < 0) {
 		sq_log("SDL_Init: %s", SDL_GetError());
 		return -1;
@@ -69,7 +82,7 @@ int ui_open(void)
 		sq_log("SDL_CreateWindow: %s", SDL_GetError());
 		return -1;
 	}
-	ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+	ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 	if (!ren)
 		ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
 	if (!ren) {
@@ -140,17 +153,40 @@ void ui_shade(void)
 	SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
 }
 
-/* The cached texture for a string, rendering it on a miss */
-static struct cached* get_text(enum font f, unsigned color, const char* s)
+/* s shortened to fit max_w (0: no limit), on a UTF-8 character boundary,
+ * with "..." added */
+static void fit_text(enum font f, const char* s, int max_w, char* buf, size_t len)
+{
+	size_t n;
+	snprintf(buf, len, "%s", s);
+	if (max_w <= 0 || ui_text_width(f, buf) <= max_w)
+		return;
+	n = strlen(buf);
+	while (n > 0) {
+		do
+			n--;
+		while (n > 0 && (buf[n] & 0xC0) == 0x80);
+		snprintf(buf + n, len - n, "...");
+		if (ui_text_width(f, buf) <= max_w)
+			break;
+	}
+}
+
+/* The cached texture for a string drawn at most max_w wide, rendering it on
+ * a miss. The key includes max_w, so a hit costs no measuring at all: on
+ * this CPU even measuring text every frame adds up. */
+static struct cached* get_text(enum font f, unsigned color, const char* s, int max_w)
 {
 	struct cached* slot = &cache[0];
 	SDL_Surface* surf;
 	SDL_Color c = { (color >> 16) & 255, (color >> 8) & 255, color & 255, 255 };
+	char buf[TEXT_MAX];
 	int i;
 
 	for (i = 0; i < CACHE_SIZE; i++) {
 		struct cached* e = &cache[i];
-		if (e->tex && e->font == f && e->color == color && !strcmp(e->text, s)) {
+		if (e->tex && e->font == f && e->color == color && e->max_w == max_w &&
+				!strncmp(e->text, s, TEXT_MAX - 1)) {
 			e->used = ++use_clock;
 			return e;
 		}
@@ -161,7 +197,8 @@ static struct cached* get_text(enum font f, unsigned color, const char* s)
 	}
 	if (!fonts[f])
 		return NULL;
-	surf = TTF_RenderUTF8_Blended(fonts[f], s, c);
+	fit_text(f, s, max_w, buf, sizeof(buf));
+	surf = TTF_RenderUTF8_Blended(fonts[f], buf, c);
 	if (!surf)
 		return NULL;
 	if (slot->tex)
@@ -172,6 +209,7 @@ static struct cached* get_text(enum font f, unsigned color, const char* s)
 	SDL_FreeSurface(surf);
 	slot->font = f;
 	slot->color = color;
+	slot->max_w = max_w;
 	snprintf(slot->text, sizeof(slot->text), "%s", s);
 	slot->used = ++use_clock;
 	return slot->tex ? slot : NULL;
@@ -185,28 +223,9 @@ int ui_text_width(enum font f, const char* s)
 	return w;
 }
 
-int ui_text(enum font f, int x, int y, unsigned color, const char* s, int max_w)
+static int draw_cached(struct cached* t, int x, int y)
 {
-	char buf[TEXT_MAX];
-	struct cached* t;
 	SDL_Rect dst;
-
-	if (!s || !*s)
-		return 0;
-	snprintf(buf, sizeof(buf), "%s", s);
-	if (max_w > 0 && ui_text_width(f, buf) > max_w) {
-		/* Shorten to fit, on a UTF-8 character boundary, and add "..." */
-		size_t n = strlen(buf);
-		while (n > 0) {
-			do
-				n--;
-			while (n > 0 && (buf[n] & 0xC0) == 0x80);
-			snprintf(buf + n, sizeof(buf) - n, "...");
-			if (ui_text_width(f, buf) <= max_w)
-				break;
-		}
-	}
-	t = get_text(f, color, buf);
 	if (!t)
 		return 0;
 	dst.x = x;
@@ -217,9 +236,20 @@ int ui_text(enum font f, int x, int y, unsigned color, const char* s, int max_w)
 	return t->w;
 }
 
+int ui_text(enum font f, int x, int y, unsigned color, const char* s, int max_w)
+{
+	if (!s || !*s)
+		return 0;
+	return draw_cached(get_text(f, color, s, max_w), x, y);
+}
+
 int ui_text_right(enum font f, int x, int y, unsigned color, const char* s)
 {
-	return ui_text(f, x - ui_text_width(f, s), y, color, s, 0);
+	struct cached* t;
+	if (!s || !*s)
+		return 0;
+	t = get_text(f, color, s, 0);
+	return t ? draw_cached(t, x - t->w, y) : 0;
 }
 
 int ui_image(const char* path, int x, int y, int w, int h)

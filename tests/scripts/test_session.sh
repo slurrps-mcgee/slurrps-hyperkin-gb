@@ -60,7 +60,8 @@ Check "menu was quit with exactly one SIGTERM" Equal "$(RaEvents)" "TERM "
 Check "with the GBA core" RaLastHas "-L $USER_CORE_DIR/gpsp_libretro.so"
 Check "ROM copied to the SD card intact" cmp -s "$READER_DIR/Pokemon_LeafGreen.gba" "$ROM_PATH/Pokemon_LeafGreen.gba"
 Check "cartridge save imported" cmp -s "$READER_DIR/Pokemon_LeafGreen.sav" "$ROM_PATH/Pokemon_LeafGreen.srm"
-Check "cartridge save backed up" Equal "$(ls "$R/userdata/saves/Pokemon_LeafGreen/")" "001-cartridge.sav"
+Check "a copy of the cartridge's save kept" cmp -s "$READER_DIR/Pokemon_LeafGreen.sav" "$R/userdata/saves/Pokemon_LeafGreen/cartridge.sav"
+Check "and nothing else (backups only when asked)" Equal "$(ls "$R/userdata/saves/Pokemon_LeafGreen/")" "cartridge.sav"
 Check "saves logged before the run" Contains "$LOG_DIR/launcher.log" "before cartridge save: 131072 bytes"
 Check "mode is cart" Equal "$(cat "$MODE_FILE")" cart
 Check "the cartridge was never written" Equal "$(grep -c 'rw' "$R/calls.log")" 0
@@ -82,7 +83,11 @@ CrcFile "$R/fakedev/sda/Pokemon_LeafGreen.gba" "$R/fakedev/sda/Pokemon_LeafGreen
 CartEvent change 1
 Check "starts again" WaitFor 8 RaLastHas "Pokemon_LeafGreen.gba"
 Check "without copying it again" Equal "$(Count sqload)" 1
-Check "the live save was kept, not replaced by the cartridge's" Equal "$(ls "$R/userdata/saves/Pokemon_LeafGreen/" | wc -l)" 2
+Check "the live save was kept, not replaced by the cartridge's" eval \
+	'! cmp -s "$READER_DIR/Pokemon_LeafGreen.sav" "$ROM_PATH/Pokemon_LeafGreen.srm"'
+Check "the copy of the cartridge's save follows the cartridge" \
+	cmp -s "$READER_DIR/Pokemon_LeafGreen.sav" "$R/userdata/saves/Pokemon_LeafGreen/cartridge.sav"
+Check "still one file: no backup piling up" Equal "$(ls "$R/userdata/saves/Pokemon_LeafGreen/" | wc -l)" 1
 
 echo "reset button"
 RUNS=$(RaRuns)

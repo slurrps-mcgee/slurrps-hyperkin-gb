@@ -56,11 +56,14 @@
 
 #if defined(__unix__)
 #include <stdio.h>
+#include <fcntl.h>
 /*
  * Retron SQ: write save RAM so a power cut leaves either the old file or
  * the new one, never a truncated one. RetroArch used to truncate the .srm
  * and write it in place, without fsync; on a console that is switched off
- * at the power that can destroy a save. Write <path>.tmp, fsync, rename.
+ * at the power that can destroy a save. Write <path>.tmp, fsync, rename,
+ * then fsync the folder: on the FAT card the rename otherwise stays in
+ * memory for up to 30 s, and a cut in that time brings back the old save.
  */
 static bool sram_write_atomic(const char *path, const void *data, size_t size)
 {
@@ -80,6 +83,19 @@ static bool sram_write_atomic(const char *path, const void *data, size_t size)
       ok = rename(tmp, path) == 0;
    if (!ok)
       remove(tmp);
+   else
+   {
+      char dir[PATH_MAX_LENGTH];
+      int fd;
+      strlcpy(dir, path, sizeof(dir));
+      path_basedir(dir);
+      fd = open(dir, O_RDONLY);
+      if (fd >= 0)
+      {
+         fsync(fd);
+         close(fd);
+      }
+   }
    return ok;
 }
 #endif

@@ -36,7 +36,12 @@ RunHome(){
 		SQ_HOME_TEST_PAD="${SQ_HOME_TEST_PAD:-}" \
 		timeout 30 "$SQHOME_BIN" > "$R/home.log" 2>&1
 	RC=$?
+	# Sanitizer reports (sqhome is built with ASan/UBSan by run-all.sh)
+	if grep -q "ERROR: AddressSanitizer\|runtime error:" "$R/home.log"; then
+		{ echo "== $1"; cat "$R/home.log"; } >> "$SAN_LOG"
+	fi
 }
+SAN_LOG=$(mktemp)
 
 Req(){
 	sed -n "s/^$1=//p" "$REQ" 2> /dev/null
@@ -84,16 +89,20 @@ Check "cartridge wait 15 -> 20 s" Equal "$(sed -n 's/^CART_WAIT=//p' "$SQ_CFG")"
 Check "GBA emulator gpsp -> mgba" Equal "$(sed -n 's/^GBA_CORE=//p' "$SQ_CFG")" mgba
 Check "start screen -> RetroArch menu" Equal "$(sed -n 's/^UI=//p' "$SQ_CFG")" retroarch
 Check "the rest of the settings file is kept" Contains "$SQ_CFG" "# Retron SQ settings."
-RunHome "up up a down down down down down down a quit"
+RunHome "up up a down down down down down down down a quit"
 Check "RetroArch settings" Equal "$(Req ACTION)" retroarch
-RunHome "up up a down down down down down down down down a b quit"
+RunHome "up up a down down down down down down down down down a b quit"
 Check "restart asks first (B: no)" test ! -f "$REQ"
-RunHome "up up a down down down down down down down down a a quit"
+RunHome "up up a down down down down down down down down down a a quit"
 Check "No is the default button" test ! -f "$REQ"
-RunHome "up up a down down down down down down down down a right a"
+RunHome "up up a down down down down down down down down down a right a"
 Check "restart (Yes)" Equal "$(Req ACTION)" reboot
-RunHome "up up a down down down down down down down down down a right shot:home-poweroff a"
+RunHome "up up a down down down down down down down down down down a right shot:home-poweroff a"
 Check "power off" Equal "$(Req ACTION)" poweroff
+# Date and time: year up, then Set (a test can't set the clock: not root)
+RunHome "up up a down down down down down down a right up shot:home-clock left up a shot:home-clock-set a quit"
+Check "date and time: tries to set the clock" Contains "$R/home.log" "setting the clock"
+Check "settings are saved before it exits" Equal "$(sed -n 's/^CART_AUTOLOAD=//p' "$SQ_CFG")" 0
 
 echo "the cartridge page"
 # With auto-load on, inserting a cartridge stops the home screen (so the
@@ -176,6 +185,10 @@ RunHome "down down down down down a a a right a quit"
 Check "a game's save is asked about twice" test -f "$R/userdata/roms/gba/Golden Sun.srm"
 RunHome "down down down down down a a a right a right shot:home-delete-save a a quit"
 Check "then deleted" test ! -f "$R/userdata/roms/gba/Golden Sun.srm"
+
+echo "memory checks (AddressSanitizer, UBSan)"
+Check "no bad memory access or undefined behaviour in any run" eval '! [ -s "$SAN_LOG" ] || { cat "$SAN_LOG"; false; }'
+rm -f "$SAN_LOG"
 
 echo "stopped by sq-session"
 NewHomeSandbox

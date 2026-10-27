@@ -327,8 +327,8 @@ CoreForRom(){
 # PrepareCart: make sure /userdata/rom holds a good copy of the inserted
 # cartridge. Uses the copy from an earlier play when the cartridge didn't
 # change (sqcart cache-valid), otherwise runs sqload (loading screen +
-# copy). Then imports the cartridge's save on its first play and backs it
-# up in saves/<game>/ when it differs from earlier backups. Returns
+# copy). Then imports the cartridge's save on its first play and keeps a
+# copy of it in saves/<game>/cartridge.sav (sqcart sync-save). Returns
 # non-zero when there is no usable copy (cartridge pulled, unreadable...).
 PrepareCart(){
 	local name verify="" rc line
@@ -369,7 +369,10 @@ PrepareCart(){
 			return 1
 		fi
 	fi
-	"$SQCART" backup-save > /dev/null
+	# saves/<game>/cartridge.sav: a copy of the cartridge's own save
+	if [ "$("$SQCART" sync-save 2> /dev/null)" = CHANGED=1 ]; then
+		LogSD "cartridge save copied to saves/${name%.*}/cartridge.sav"
+	fi
 	sync
 	[ -f "$ROM_PATH$name" ]
 }
@@ -483,6 +486,7 @@ RunHomeRequest(){
 			;;
 		reboot|poweroff)
 			LogSD "$action, from the home screen"
+			"$SQCART" clock-save
 			sync
 			$action
 			;;
@@ -537,6 +541,15 @@ LaunchMenu(){
 #   2. Copy the built-in cores into retroarch/cores, so RetroArch's
 #      "Load Core" lists them next to the user's own cores. Only redone when
 #      the firmware's cores change (tracked with a checksum stamp file).
+# ClockKeeper: save the time on the SD card every 5 minutes (the console
+# has no battery-backed clock; S21mountall sets it back at boot)
+ClockKeeper(){
+	"$SQCART" clock-save
+	while sleep "${CLOCK_EVERY:-300}"; do
+		"$SQCART" clock-save
+	done
+}
+
 SyncUserdata(){
 	local stamp so
 	# Never write into the read-only rootfs if userdata didn't mount

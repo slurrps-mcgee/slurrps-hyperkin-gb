@@ -205,7 +205,7 @@ void sq_do_write_save(const struct sq_cart* c, const char* path, const char* rw_
 	}
 
 	/* The cartridge's own save is kept before it is unlocked */
-	n = sq_backup_cart_save(c, &existed, progress, ctx, 0, &e);
+	n = sq_backup_cart_save_as(c, "before-write", &existed, progress, ctx, 0, &e);
 	if (n < 0) {
 		failed(r, "Backing up the cartridge's save failed:", &e);
 		goto done;
@@ -224,6 +224,8 @@ void sq_do_write_save(const struct sq_cart* c, const char* path, const char* rw_
 	snprintf(line, sizeof(line), "Its previous save is backup #%d.", n);
 	if (rc != 0) {
 		sq_log_sd("tools: writing to the cartridge failed: %s", e.msg);
+		if (strstr(e.msg, "reads back different"))
+			sq_cart_write_record(c, 0, 0);	/* the slot didn't take it */
 		failed(r, "Writing to the cartridge failed:", &e);
 		snprintf(r->line[3], sizeof(r->line[3]), "%s", line);
 	} else {
@@ -260,7 +262,7 @@ void sq_do_write_rom(const struct sq_cart* c, const char* path, const char* rw_c
 
 	/* The cartridge's save is kept first: a new game may not keep it */
 	if (c->save_size > 0) {
-		n = sq_backup_cart_save(c, &existed, progress, ctx, 0, &e);
+		n = sq_backup_cart_save_as(c, "before-write", &existed, progress, ctx, 0, &e);
 		if (n < 0) {
 			failed(r, "Backing up the cartridge's save failed:", &e);
 			return;
@@ -288,6 +290,8 @@ void sq_do_write_rom(const struct sq_cart* c, const char* path, const char* rw_c
 		return;
 	}
 	sq_log_sd("tools: writing the game to the cartridge failed: %s", e.msg);
+	if (strstr(e.msg, "reads back different") && !strstr(e.msg, "part of it"))
+		sq_cart_write_record(c, 1, 0);	/* the slot didn't take it */
 	if (strstr(e.msg, "part of it"))
 		result(r, 0, "Only part of the game was written.",
 			"The cartridge may not start now; write it",

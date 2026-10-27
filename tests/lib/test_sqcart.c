@@ -7,7 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "sqcart.h"
@@ -375,7 +377,7 @@ static void test_rom_write(void)
 	put_text("/run/retronsq/reader-wp", "0\n");
 	sq_do_write_rom(&c, src, "true", NULL, NULL, &r);
 	CHECK(r.ok && strstr(r.line[0], "Written"));
-	CHECK(exists("/userdata/saves/Blank/001-cartridge.sav"));	/* its save kept first */
+	CHECK(exists("/userdata/saves/Blank/001-before-write.sav"));	/* its save kept first */
 
 	/* Checked when a cartridge comes back: under the new game's name... */
 	remove_cart();
@@ -403,6 +405,85 @@ static void test_rom_write(void)
 	free(game);
 }
 
+/* The copy of the cartridge's save, and old duplicate backups */
+static void test_cart_save_copy(void)
+{
+	struct sq_cart c;
+	struct sq_error e;
+	struct sq_backup list[16];
+	int changed;
+	char p[SQ_PATH_LEN];
+
+	clean();
+	insert_cart("Game.gba", 4096, 8192, 30, 1, 1);
+	sq_cart_scan(&c);
+	/* Three identical backups, as older versions made on every insert, and
+	 * one that differs */
+	put("/userdata/saves/Game/001-cartridge.sav", "aaaa", 4);
+	put("/userdata/saves/Game/002-cartridge.sav", "aaaa", 4);
+	put("/userdata/saves/Game/003-cartridge.sav", "bbbb", 4);
+	put("/userdata/saves/Game/004-cartridge.sav", "aaaa", 4);
+
+	CHECK(sq_sync_cart_save(&c, &changed, &e) == 0 && changed);
+	path(p, "/media/cart/Game.sav");
+	{
+		long size;
+		unsigned char* sav = sq_read_all(p, SQ_MAX_SAVE, &size);
+		path(p, "/userdata/saves/Game/cartridge.sav");
+		CHECK(sav && sq_same_content(p, sav, size));
+		free(sav);
+	}
+	CHECK(sq_backup_list("Game", list, 16) == 2);		/* duplicates gone */
+	CHECK(exists("/userdata/saves/Game/001-cartridge.sav") && exists("/userdata/saves/Game/003-cartridge.sav"));
+	CHECK(sq_sync_cart_save(&c, &changed, &e) == 0 && !changed);	/* the same: not rewritten */
+	CHECK(sq_backup_list("Game", list, 16) == 2);		/* and no new backup */
+
+	/* What writing to it did, remembered per cartridge */
+	CHECK(sq_cart_write_known(&c, 0) == -1 && sq_cart_write_known(&c, 1) == -1);
+	sq_cart_write_record(&c, 0, 0);
+	sq_cart_write_record(&c, 1, 1);
+	CHECK(sq_cart_write_known(&c, 0) == 0 && sq_cart_write_known(&c, 1) == 1);
+	sq_cart_write_record(&c, 0, 1);
+	CHECK(sq_cart_write_known(&c, 0) == 1);
+	{
+		char* text = read_text("/userdata/home/cart-writes.txt");
+		CHECK(text && !strstr(text, "\tsave\t0"));		/* replaced, not added */
+		free(text);
+	}
+	remove_cart();
+	insert_cart("Other.gba", 4096, 8192, 31, 1, 2);
+	sq_cart_scan(&c);
+	CHECK(sq_cart_write_known(&c, 0) == -1);		/* another cartridge */
+}
+
+/* The clock: back to the last saved time at boot */
+static void test_clock(void)
+{
+	char p[SQ_PATH_LEN];
+	long now = (long)time(NULL);
+
+	clean();
+	CHECK(sq_clock_wanted() == 0);				/* nothing saved */
+	put_text("/userdata/home/clock", "%ld\n", now + 3600);
+	CHECK(sq_clock_wanted() == now + 3600);			/* saved later than now */
+	put_text("/userdata/home/clock", "%ld\n", now - 3600);
+	CHECK(sq_clock_wanted() == 0);				/* already later */
+	CHECK(sq_clock_save() == 0);
+	{
+		char* text = read_text("/userdata/home/clock");
+		CHECK(text && labs(atol(text) - now) < 5);
+		free(text);
+	}
+	/* The firmware's build time is the earliest it can be */
+	put_text("/etc/retronsq-version", "Retron SQ CFW test\n");
+	path(p, "/etc/retronsq-version");
+	{
+		struct timespec t[2] = { { now + 7200, 0 }, { now + 7200, 0 } };
+		CHECK(utimensat(AT_FDCWD, p, t, 0) == 0);
+	}
+	CHECK(sq_clock_wanted() == now + 7200);
+}
+
 /* The Saves page and deleting games and saves */
 static void test_saves_and_delete(void)
 {
@@ -419,15 +500,17 @@ static void test_saves_and_delete(void)
 	put("/userdata/rom/Pokemon_Emerald.srm", "s", 1);
 	put("/userdata/saves/Pokemon_Emerald/001-cartridge.sav", "b", 1);
 	put("/userdata/saves/Pokemon_Emerald/002-before-restore.sav", "b", 1);
+	put("/userdata/saves/Pokemon_Emerald/cartridge.sav", "c", 1);
 
 	n = sq_saves_scan(&f);
-	CHECK(n == 5);
-	CHECK(n == 5 && !strcmp(f[0].label, "Pokemon Emerald") && f[0].live &&
-		!strcmp(f[0].kind, "Cartridge save"));
-	CHECK(n == 5 && f[1].backup == 2 && !strcmp(f[1].kind, "Backup #2 (before restore)"));
-	CHECK(n == 5 && f[2].backup == 1);
-	CHECK(n == 5 && !strcmp(f[3].label, "Tetris") && !strcmp(f[3].kind, "Game Boy save"));
-	CHECK(n == 5 && !strcmp(f[4].path, "/userdata/roms/gba/Zelda.srm"));	/* no $SQ_ROOT */
+	CHECK(n == 6);
+	CHECK(n == 6 && !strcmp(f[0].label, "Pokemon Emerald") && f[0].live &&
+		!strcmp(f[0].kind, "Save for playing the cartridge"));
+	CHECK(n == 6 && f[1].copy && !strcmp(f[1].kind, "Copy of the cartridge's save"));
+	CHECK(n == 6 && f[2].backup == 2 && !strcmp(f[2].kind, "Backup #2 (before restore)"));
+	CHECK(n == 6 && f[3].backup == 1);
+	CHECK(n == 6 && !strcmp(f[4].label, "Tetris") && !strcmp(f[4].kind, "Game Boy save"));
+	CHECK(n == 6 && !strcmp(f[5].path, "/userdata/roms/gba/Zelda.srm"));	/* no $SQ_ROOT */
 	free(f);
 
 	/* Deleting: only games and saves, only in their folders */
@@ -444,7 +527,7 @@ static void test_saves_and_delete(void)
 	CHECK(sq_delete_save("/userdata/home/history.txt", &e) != 0);
 	CHECK(sq_delete_save("/userdata/roms/gb/Missing.srm", &e) != 0 && strstr(e.msg, "deleting"));
 	n = sq_saves_scan(&f);
-	CHECK(n == 3);
+	CHECK(n == 4);
 	free(f);
 }
 
@@ -596,6 +679,8 @@ int main(void)
 	test_cart_write();
 	test_rom_write();
 	test_saves_and_delete();
+	test_cart_save_copy();
+	test_clock();
 	test_config();
 	test_library();
 	test_meter();

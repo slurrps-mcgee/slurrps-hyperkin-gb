@@ -27,6 +27,10 @@
 /* What the last write put on which cartridge, until it is checked */
 #define CHECK_FILE SQ_HOME_DIR "/cart-write-check"
 
+/* What writing to each cartridge did, once known: lines of
+ * "<rom file>\t<rom size>\t<save|game>\t<1|0>" */
+#define WRITES_FILE SQ_HOME_DIR "/cart-writes.txt"
+
 /* cart-event writes "0" or "1" here: the drive's read-only flag before it
  * locked it (the kernel sets it when the device reports write protection) */
 #define WP_FILE SQ_RUN_DIR "/reader-wp"
@@ -42,6 +46,77 @@ int sq_reader_writable(void)
 	c = fgetc(fp);
 	fclose(fp);
 	return c == '0' ? 1 : c == '1' ? 0 : -1;
+}
+
+/* --- what is known about writing to a cartridge -------------------------- */
+
+/* line is about cartridge c and kind (game or save) */
+static int writes_line_is(const char* line, const struct sq_cart* c, int game, int* ok)
+{
+	char rom[300], kind[8];
+	long size;
+	return sscanf(line, "%299[^\t]\t%ld\t%7s\t%d", rom, &size, kind, ok) == 4 &&
+		!strcmp(rom, c->rom) && size == c->rom_size && !strcmp(kind, game ? "game" : "save");
+}
+
+int sq_cart_write_known(const struct sq_cart* c, int game)
+{
+	char path[SQ_PATH_LEN], line[400];
+	int ok, known = -1;
+	FILE* fp;
+
+	if (!c->present)
+		return -1;
+	fp = fopen(sq_path(path, sizeof(path), WRITES_FILE), "r");
+	if (!fp)
+		return -1;
+	while (fgets(line, sizeof(line), fp))
+		if (writes_line_is(line, c, game, &ok))
+			known = ok ? 1 : 0;	/* the last line for it wins */
+	fclose(fp);
+	return known;
+}
+
+void sq_cart_write_record(const struct sq_cart* c, int game, int ok)
+{
+	char path[SQ_PATH_LEN], line[400];
+	char* text;
+	long used = 0, cap = 4096, n;
+	int old_ok;
+	FILE* fp;
+
+	if (!c->present || sq_cart_write_known(c, game) == (ok ? 1 : 0))
+		return;
+	text = (char*)malloc(cap);
+	if (!text)
+		return;
+	/* Every other cartridge's lines, then this one's */
+	fp = fopen(sq_path(path, sizeof(path), WRITES_FILE), "r");
+	while (fp && fgets(line, sizeof(line), fp)) {
+		if (writes_line_is(line, c, game, &old_ok))
+			continue;
+		n = (long)strlen(line);
+		if (used + n + 400 > cap) {
+			char* more = (char*)realloc(text, cap * 2 + n);
+			if (!more)
+				break;
+			text = more;
+			cap = cap * 2 + n;
+		}
+		memcpy(text + used, line, n);
+		used += n;
+	}
+	if (fp)
+		fclose(fp);
+	if (used + 400 <= cap) {
+		used += snprintf(text + used, 400, "%s\t%ld\t%s\t%d\n", c->rom, c->rom_size,
+			game ? "game" : "save", ok ? 1 : 0);
+		sq_mkdirs(sq_path(path, sizeof(path), SQ_HOME_DIR));
+		sq_write_atomic(sq_path(path, sizeof(path), WRITES_FILE), text, used, NULL);
+		sq_log_sd("tools: %s: writing a %s %s", c->rom, game ? "game" : "save",
+			ok ? "works" : "doesn't stick");
+	}
+	free(text);
 }
 
 #define CHUNK (64 * 1024)	/* writes and read-backs go in these steps */
@@ -361,12 +436,14 @@ static int check_rom(const struct sq_cart* c, const char* text, const char* reco
 	same_old = check_value(text, "ROM=", rom, sizeof(rom)) && !strcmp(rom, c->rom) &&
 		check_value(text, "ROM_SIZE=", v, sizeof(v)) && atol(v) == c->rom_size;
 	if (written) {
+		sq_cart_write_record(c, 1, 1);
 		verdict(r, 1, "The game is on the cartridge.",
 			"The game written to it earlier was read back",
 			"after the cartridge was put back in.", NULL);
 		sq_log_sd("tools: checked after re-inserting: the written game is on the cartridge (%s)",
 			c->rom);
 	} else if (same_old) {
+		sq_cart_write_record(c, 1, 0);
 		verdict(r, 0, "The cartridge still has its old game.",
 			"The cartridge slot took the write but the",
 			"cartridge didn't keep it (most cartridges",
@@ -411,12 +488,14 @@ int sq_write_check(const struct sq_cart* c, struct sq_result* r)
 	sq_cart_reader_path(c, ".sav", sav, sizeof(sav));
 	data = sq_read_all(sav, SQ_MAX_SAVE, &size);
 	if (data && (unsigned)sq_crc_buffer(0, data, size) == want_crc) {
+		sq_cart_write_record(c, 0, 1);
 		verdict(r, 1, "Your save is on the cartridge.",
 			"The save written to it earlier was read back",
 			"after the cartridge was put back in.", NULL);
 		sq_log_sd("tools: checked after re-inserting %s: the written save is on the cartridge",
 			c->rom);
 	} else {
+		sq_cart_write_record(c, 0, 0);
 		verdict(r, 0, "The cartridge still has its old save.",
 			"The cartridge slot took the write but didn't",
 			"store it on the cartridge. Your save is safe",

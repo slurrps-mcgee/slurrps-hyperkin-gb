@@ -9,6 +9,8 @@
  *   sqcart cache [--progress]    copy the cartridge into the cache
  *   sqcart import-save           first play: cartridge save -> live save
  *   sqcart backup-save           back up the cartridge's save (prints number)
+ *   sqcart sync-save             keep saves/<game>/cartridge.sav the same as
+ *                                the cartridge's save (prints CHANGED=0|1)
  *   sqcart check-save FILE [CODE]   report on a save (Gen 3 Pokémon in detail)
  *   sqcart rom-header FILE       TITLE= and CODE= of a ROM file
  *   sqcart crc FILE              the reader's CRC of a file (decimal), as
@@ -20,11 +22,16 @@
  *                                and the lines to show; exit 1 when there
  *                                was nothing to check
  *
+ *   sqcart clock-restore         at boot: set the clock to the last saved
+ *                                time (or the firmware's build time)
+ *   sqcart clock-save            save the time on the SD card
+ *
  * See sqcart.h for what each one does underneath.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "../lib/sqcart.h"
 
@@ -32,9 +39,9 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: sqcart info | reader-state | cache-valid [--verify] | cache |\n"
-		"              import-save | backup-save | check-save FILE [CODE] |\n"
+		"              import-save | backup-save | sync-save | check-save FILE [CODE] |\n"
 		"              rom-header FILE | crc FILE | history-add PATH LABEL |\n"
-		"              write-check\n");
+		"              write-check | clock-restore | clock-save\n");
 }
 
 /* Print a value for the shell, without characters that would break KEY=value */
@@ -143,6 +150,23 @@ static int cmd_backup_save(void)
 	return 0;
 }
 
+/* sync-save: CHANGED=1 when cartridge.sav was (re)written */
+static int cmd_sync_save(void)
+{
+	struct sq_cart c;
+	struct sq_error e = { "", 0 };
+	int changed;
+
+	if (!need_cart(&c))
+		return 1;
+	if (sq_sync_cart_save(&c, &changed, &e) != 0) {
+		fprintf(stderr, "sqcart: %s\n", e.msg);
+		return 1;
+	}
+	printf("CHANGED=%d\n", changed);
+	return 0;
+}
+
 /* check-save: size check, and the Gen 3 slot report for Pokémon codes */
 static int cmd_check_save(const char* path, const char* code)
 {
@@ -187,6 +211,8 @@ int main(int argc, char** argv)
 		return cmd_import_save();
 	if (!strcmp(cmd, "backup-save"))
 		return cmd_backup_save();
+	if (!strcmp(cmd, "sync-save"))
+		return cmd_sync_save();
 	if (!strcmp(cmd, "check-save") && argc > 2)
 		return cmd_check_save(argv[2], argc > 3 ? argv[3] : NULL);
 	if (!strcmp(cmd, "rom-header") && argc > 2) {
@@ -207,6 +233,25 @@ int main(int argc, char** argv)
 		for (i = 0; i < 4; i++)
 			if (r.line[i][0])
 				printf("%s\n", r.line[i]);
+		return 0;
+	}
+	if (!strcmp(cmd, "clock-save"))
+		return sq_clock_save() == 0 ? 0 : 1;
+	if (!strcmp(cmd, "clock-restore")) {
+		struct sq_error e;
+		long t = sq_clock_wanted();
+		time_t tt = (time_t)t;
+		char when[32];
+		if (!t) {
+			printf("clock: already right\n");
+			return 0;
+		}
+		strftime(when, sizeof(when), "%Y-%m-%d %H:%M", gmtime(&tt));
+		if (sq_clock_set(t, &e) != 0) {
+			fprintf(stderr, "clock: %s\n", e.msg);
+			return 1;
+		}
+		printf("clock: set to %s (no battery-backed clock: the last saved time)\n", when);
 		return 0;
 	}
 	if (!strcmp(cmd, "history-add") && argc > 3)

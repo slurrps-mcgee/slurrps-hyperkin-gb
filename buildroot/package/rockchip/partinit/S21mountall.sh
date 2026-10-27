@@ -67,50 +67,72 @@ fat_fs_size()
 	echo $(($BPS * $TOTAL))
 }
 
-# expand_fat DEV LABEL: make the FAT filesystem on DEV fill its partition
+# expand_fat DEV LABEL: make the FAT filesystem on DEV fill its partition.
+# There is no reliable in-place FAT resizer, so its files are copied to
+# memory (/tmp), the partition is reformatted at its full size and the
+# files are put back. resize_fat only calls this for a small, image-sized
+# filesystem, so the copy is at most a few dozen MB.
 expand_fat()
 {
-	# There is no reliable in-place FAT resizer, so back up the (small)
-	# freshly-flashed contents, reformat the whole partition and restore.
 	DEV=$1
 	LABEL=$2
 	TEMP=$(mktemp -d)
 	BACKUP=/tmp/fat-expand.tar
 
-	mount -t vfat $DEV $TEMP || { rmdir $TEMP; return; }
+	# Repair first (clusters lost to power cuts), so the copy is complete
+	fsck.fat -a $DEV > /dev/null 2>&1
 
-	# Never touch a partition holding real user data (e.g. ROMs)
+	if ! mount -t vfat $DEV $TEMP;then
+		echo "expand: can't mount $DEV, not expanding"
+		rmdir $TEMP
+		return
+	fi
 	USED_KB=$(du -sk $TEMP | cut -f 1)
-	if [ $USED_KB -gt $((32 * 1024)) ];then
-		echo "$DEV holds ${USED_KB}K, not expanding it"
+	ENTRIES=$(find $TEMP | wc -l)
+	FREE_KB=$(df -k /tmp | tail -n 1 | awk '{ print $(NF - 2) }')
+	echo "expand: $DEV holds ${USED_KB}K in $ENTRIES files and folders;" \
+		"${FREE_KB}K free in memory"
+	if [ $(($USED_KB + 8192)) -gt ${FREE_KB:-0} ];then
+		echo "expand: not enough memory to keep its files, not expanding"
 		umount $TEMP; rmdir $TEMP
 		return
 	fi
 
 	echo Expanding $DEV...
 	if ! tar -cf $BACKUP -C $TEMP .;then
+		echo "expand: copying its files failed, not expanding"
 		umount $TEMP; rmdir $TEMP; rm -f $BACKUP
 		return
 	fi
 	umount $TEMP
 
-	if mkfs.fat -F 32 -n $LABEL $DEV;then
-		mount -t vfat $DEV $TEMP && tar -xf $BACKUP -C $TEMP
-		sync
-		umount $TEMP
+	if ! mkfs.fat -F 32 -n $LABEL $DEV;then
+		echo "expand: mkfs.fat failed"
 	fi
+	if mount -t vfat $DEV $TEMP && tar -xf $BACKUP -C $TEMP;then
+		echo "expand: done, $(find $TEMP | wc -l) of $ENTRIES files and folders back"
+	else
+		echo "expand: PUTTING THE FILES BACK FAILED"
+	fi
+	sync
+	umount $TEMP
 	rmdir $TEMP
 	rm -f $BACKUP
 }
 
 # resize_fat DEV MOUNTPOINT PARTNAME MAXSIZE: format a blank FAT partition,
 # or expand a FAT that is smaller than its partition (the freshly flashed
-# 64M userdata image). Used for userdata, which is FAT32 so PCs can read it.
+# 64M userdata image, possibly with ROMs already copied onto it). Used for
+# userdata, which is FAT32 so PCs can read it.
 resize_fat()
 {
 	DEV=$1
 	MAX_SIZE=$4
 	LABEL=RETRONSQ
+	# The image's filesystem is 64M. One up to this size can be rebuilt to
+	# fill its partition; a bigger FAT was made by the user (on a PC) and is
+	# never reformatted.
+	REBUILD_MAX=$((256 * 1024 * 1024))
 
 	SIZE=$(fat_fs_size $DEV)
 	echo "fat: $DEV filesystem ${SIZE:-unreadable} bytes, partition $MAX_SIZE bytes"
@@ -126,6 +148,10 @@ resize_fat()
 
 	# Avoid resizing when it's large enough (delta less than 16M)
 	[ $SIZE -gt $(($MAX_SIZE - 16 * 1024 * 1024)) ] && return
+	if [ $SIZE -gt $REBUILD_MAX ];then
+		echo "fat: $DEV is bigger than the image's filesystem, not rebuilding it"
+		return
+	fi
 
 	expand_fat $DEV $LABEL
 }
@@ -375,6 +401,9 @@ case "$1" in
 		T_MOUNT=$(uptime_s)
 		mountall 2>&1 | tee $MOUNT_LOG
 		echo Log saved to $MOUNT_LOG
+		# No battery-backed clock: back to the last saved time, so files
+		# (saves) get sensible dates (Retron SQ firmware: sqcart)
+		[ -x /usr/bin/sqcart ] && /usr/bin/sqcart clock-restore 2>&1 | tee -a $MOUNT_LOG
 		save_boot_log
 	fi
 	touch /tmp/boot_complete

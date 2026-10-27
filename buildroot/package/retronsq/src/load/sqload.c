@@ -256,6 +256,9 @@ static SDL_Renderer* open_screen(SDL_Window** win)
 
 	/* Rockchip's SDL picks the HDMI output with this (as the stock loader did) */
 	setenv("SDL_MONITOR_INDEX", "1", 0);
+	/* Vsync, each frame waited for: see ui_open in home/ui.c (without it the
+	 * display stops updating after about 128 frames) */
+	SDL_SetHint("SDL_VIDEO_DOUBLE_BUFFER", "1");	/* SDL_HINT_VIDEO_DOUBLE_BUFFER */
 	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) < 0) {
 		sq_log("SDL_Init: %s", SDL_GetError());
 		goto fail;
@@ -270,7 +273,7 @@ static SDL_Renderer* open_screen(SDL_Window** win)
 		sq_log("SDL_CreateWindow: %s", SDL_GetError());
 		goto fail;
 	}
-	r = SDL_CreateRenderer(*win, -1, SDL_RENDERER_ACCELERATED);
+	r = SDL_CreateRenderer(*win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 	if (!r)
 		r = SDL_CreateRenderer(*win, -1, SDL_RENDERER_SOFTWARE);
 	if (!r) {

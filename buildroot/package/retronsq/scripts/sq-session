@@ -23,6 +23,7 @@
 echo $$ > "$SESSION_PID"
 LogSD "boot: session started"
 SyncUserdata
+ClockKeeper > /dev/null 2>&1 &
 # A cartridge inserted at power-on must start before the menu ever shows
 WaitForReader
 # The splash stays until the first program (loading screen, game or home

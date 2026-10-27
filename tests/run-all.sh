@@ -221,6 +221,14 @@ elif Want load; then
 fi
 
 if [ -x "${SQHOME_BIN:-}" ]; then
+	# The home screen under AddressSanitizer and UBSan: a crash or a bad
+	# memory access fails the test (test_home.sh checks each run's output)
+	if Want home && gcc -std=gnu99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+			-Wall -Wno-format-truncation -o "$BUILD/sqhome-asan" "$PKG"/src/home/*.c \
+			"$PKG"/src/lib/*.c -lSDL2 -lSDL2_image -lSDL2_ttf -lpthread -lm; then
+		SQHOME_BIN="$BUILD/sqhome-asan"
+		export ASAN_OPTIONS=detect_leaks=0
+	fi
 	ScriptTest home "$TESTS/home/test_home.sh"
 elif Want home; then
 	Header "home: skipped, sqhome wasn't built"

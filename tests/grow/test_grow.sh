@@ -145,5 +145,115 @@ Check "a blank partition is formatted" Contains "$G/resize.log" "MKFS -F 32 -n R
 head -c 65536 /dev/urandom > "$G/junk.img"; truncate -s 64M "$G/junk.img"
 RunResizeFat "$G/junk.img"
 Check "an unreadable partition is never formatted" eval '! grep -q "EXPAND\|MKFS" "$G/resize.log"'
+truncate -s 0 "$G/big.img"; truncate -s 300M "$G/big.img"
+PATH=/sbin:/usr/sbin:$PATH mkfs.fat -F 32 -n MYCARD "$G/big.img" > /dev/null
+truncate -s 1G "$G/big.img"
+RunResizeFat "$G/big.img"
+Check "a big FAT (made on a PC) is never rebuilt" eval '! grep -q "EXPAND\|MKFS" "$G/resize.log"'
+Check "and that is logged" Contains "$G/resize.log" "bigger than the image's filesystem"
+
+# --- The expansion itself, for real ------------------------------------------
+#
+# expand_fat as the console runs it (its busybox tar, du, find, df; the real
+# mkfs.fat and fsck.fat), on FAT images. Mounting needs root, so mount and
+# umount are stubs that move the files in and out of the image with mtools.
+
+# mtools checks disk geometry, which plain image files don't have
+export MTOOLS_SKIP_CHECK=1
+
+# MakeUserdata PARTITION_MIB: the 64M FAT the SD card image is flashed with,
+# holding 40 MB of files (more than v0.3.1's 32 MB limit), in a partition of
+# PARTITION_MIB
+MakeUserdata(){
+	F="$G/files"
+	rm -rf "$F" "$G/userdata.img"
+	mkdir -p "$F/roms/gba" "$F/saves/Golden_Sun" "$F/retroarch/autoconfig"
+	head -c 12582912 /dev/urandom > "$F/roms/gba/Golden Sun.gba"
+	head -c 16777216 /dev/urandom > "$F/roms/gba/Pokemon - Emerald Version.gba"
+	head -c 12582912 /dev/urandom > "$F/roms/gba/Metroid Fusion.gba"
+	head -c 131072 /dev/urandom > "$F/saves/Golden_Sun/cartridge.sav"
+	echo "CART_AUTOLOAD=0" > "$F/retronsq.cfg"
+	echo 'input_driver = "udev"' > "$F/retroarch/autoconfig/Hyperkin_SQ.cfg"
+	truncate -s 64M "$G/userdata.img"
+	PATH=/sbin:/usr/sbin:$PATH mkfs.fat -F 32 -n RETRONSQ "$G/userdata.img" > /dev/null
+	mcopy -s -i "$G/userdata.img" "$F"/* ::/
+	truncate -s "$1M" "$G/userdata.img"
+}
+
+# Mount and umount stubs on mtools: mount copies the image's files into the
+# folder; umount writes the folder back into a freshly formatted (empty)
+# image, then empties the folder
+FatStubs(){
+	mkdir -p "$G/fatbin"
+	cat > "$G/fatbin/mount" <<-EOF
+	#!$BUSYBOX sh
+	dev=\$3 dir=\$4
+	echo "\$dir \$dev" >> "$G/mounted"
+	mcopy -s -p -n -i "\$dev" "::*" "\$dir/" 2> /dev/null
+	exit 0
+	EOF
+	cat > "$G/fatbin/umount" <<-EOF
+	#!$BUSYBOX sh
+	dir=\$1
+	dev=\$(awk -v d="\$dir" '\$1 == d { x = \$2 } END { print x }' "$G/mounted")
+	if [ -z "\$(mdir -b -i "\$dev" ::/ 2> /dev/null)" ] && [ -n "\$(ls -A "\$dir")" ]; then
+		mcopy -s -p -i "\$dev" "\$dir"/* ::/
+	fi
+	rm -rf "\$dir"/*
+	exit 0
+	EOF
+	if [ "$LOW_MEMORY" = 1 ]; then
+		printf '#!%s sh\necho "Filesystem 1K-blocks Used Available Use%% Mounted on"\necho "tmpfs 20000 10000 10000 50%% /tmp"\n' "$BUSYBOX" > "$G/fatbin/df"
+	else
+		rm -f "$G/fatbin/df"
+	fi
+	chmod +x "$G/fatbin/"*
+}
+
+# RunExpand IMAGE: S21mountall.sh's resize_fat (and expand_fat) on IMAGE
+RunExpand(){
+	FatStubs
+	{
+		sed -n '/^le_uint()/,/^}/p; /^fat_fs_size()/,/^}/p; /^expand_fat()/,/^}/p; /^resize_fat()/,/^}/p' "$MOUNTALL"
+		echo 'resize_fat $1 /userdata userdata $(stat -c %s $1)'
+	} > "$G/expand.sh"
+	PATH="$G/fatbin:/sbin:/usr/sbin:$BASE_PATH" "$BUSYBOX" sh "$G/expand.sh" "$1" > "$G/expand.log" 2>&1
+}
+
+# FsSize IMAGE: the FAT filesystem's size in MiB, from its boot sector
+FsSize(){
+	echo $(( $(hexdump -s 32 -n 4 -e '1/4 "%u"' "$1") * 512 / 1048576 ))
+}
+
+# SameFiles: the image holds exactly the files MakeUserdata put in
+SameFiles(){
+	rm -rf "$G/out"; mkdir -p "$G/out"
+	mcopy -s -n -i "$G/userdata.img" "::*" "$G/out/" 2> /dev/null
+	diff -r "$G/files" "$G/out" > /dev/null
+}
+
+for PART in 128 512; do
+	echo "first boot: the 64M image with 40 MB of games, on a $PART MiB partition"
+	NewSandbox
+	G="$SQ_ROOT"
+	MakeUserdata $PART
+	RunExpand "$G/userdata.img"
+	Check "expanded" Contains "$G/expand.log" "expand: done"
+	Check "the filesystem fills the partition" eval '[ $(FsSize "$G/userdata.img") -ge $(($PART - 1)) ]'
+	Check "every file kept, unchanged" SameFiles
+	Check "named RETRONSQ" eval 'mlabel -s -i "$G/userdata.img" :: | grep -q RETRONSQ'
+	Check "a valid filesystem" eval 'PATH=/sbin:/usr/sbin:$PATH fsck.fat -n "$G/userdata.img" > /dev/null'
+	RunExpand "$G/userdata.img"
+	Check "next boot: nothing to do" eval '! grep -q "Expanding" "$G/expand.log"'
+done
+
+echo "not enough memory to keep the files"
+NewSandbox
+G="$SQ_ROOT"
+MakeUserdata 512
+LOW_MEMORY=1 RunExpand "$G/userdata.img"
+Check "left as it is" Contains "$G/expand.log" "not enough memory"
+Check "files untouched" SameFiles
+Check "still 64M" Equal "$(FsSize "$G/userdata.img")" 64
 
 Done

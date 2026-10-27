@@ -7,8 +7,12 @@
  *     user asks for it). Its save is copied to the cache as
  *     <name>.srm the first time (sq_import_save); from then on that .srm is
  *     the live save RetroArch reads and writes.
- *   - Backups live in SQ_SAVES_DIR/<name>/NNN-<kind>.sav, numbered upward;
- *     an identical backup is never stored twice.
+ *   - SQ_SAVES_DIR/<name>/cartridge.sav is a copy of the cartridge's own
+ *     save, refreshed each time the cartridge is played (sq_sync_cart_save).
+ *   - Backups live next to it as NNN-<kind>.sav, numbered upward, made when
+ *     the user asks (Back up cartridge save) or before something is
+ *     overwritten (a restore, a write to the cartridge). An identical
+ *     backup is never stored twice.
  *   - Every write goes through sq_write_atomic.
  */
 #include <dirent.h>
@@ -16,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "sqcart.h"
 
@@ -123,7 +128,74 @@ int sq_backup_store(const char* game, const void* data, long size,
 	return sq_write_atomic(path, data, size, e) == 0 ? n : -1;
 }
 
+void sq_cart_save_copy_path(const char* game, char* out, size_t len)
+{
+	char dir[SQ_PATH_LEN];
+	backup_dir(game, dir, sizeof(dir));
+	snprintf(out, len, "%s/" SQ_CART_SAVE_COPY, dir);
+}
+
+/* Delete backups that hold exactly what an older backup holds (left over
+ * from versions that backed up on every insert); the oldest stays */
+static void dedupe_backups(const char* game)
+{
+	struct sq_backup list[64];
+	unsigned char* data[64];
+	long size[64];
+	int n = sq_backup_list(game, list, 64), i, j;
+
+	/* list is newest first: compare each with every older one */
+	for (i = 0; i < n; i++)
+		data[i] = sq_read_all(list[i].path, SQ_MAX_SAVE, &size[i]);
+	for (i = 0; i < n; i++) {
+		for (j = i + 1; j < n && data[i]; j++) {
+			if (data[j] && size[i] == size[j] && !memcmp(data[i], data[j], size[i])) {
+				if (unlink(list[i].path) == 0)
+					sq_log_sd("saves: deleted %s, the same as backup #%d",
+						list[i].path, list[j].number);
+				break;
+			}
+		}
+	}
+	for (i = 0; i < n; i++)
+		free(data[i]);
+}
+
+int sq_sync_cart_save(const struct sq_cart* c, int* changed, struct sq_error* e)
+{
+	char path[SQ_PATH_LEN], dir[SQ_PATH_LEN];
+	unsigned char* data;
+	long size;
+	int rc = 0;
+
+	*changed = 0;
+	if (c->save_size <= 0)
+		return 0;
+	sq_cart_reader_path(c, ".sav", path, sizeof(path));
+	data = sq_read_all(path, SQ_MAX_SAVE, &size);
+	if (!data) {
+		sq_fail(e, errno, "reading the cartridge's save");
+		return -1;
+	}
+	backup_dir(c->base, dir, sizeof(dir));
+	sq_mkdirs(dir);
+	sq_cart_save_copy_path(c->base, path, sizeof(path));
+	if (!sq_same_content(path, data, size)) {
+		rc = sq_write_atomic(path, data, size, e);
+		*changed = rc == 0;
+	}
+	free(data);
+	dedupe_backups(c->base);
+	return rc;
+}
+
 int sq_backup_cart_save(const struct sq_cart* c, int* existed,
+	sq_progress_fn progress, void* ctx, long base, struct sq_error* e)
+{
+	return sq_backup_cart_save_as(c, "cartridge", existed, progress, ctx, base, e);
+}
+
+int sq_backup_cart_save_as(const struct sq_cart* c, const char* kind, int* existed,
 	sq_progress_fn progress, void* ctx, long base, struct sq_error* e)
 {
 	char path[SQ_PATH_LEN];
@@ -140,7 +212,7 @@ int sq_backup_cart_save(const struct sq_cart* c, int* existed,
 		sq_fail(e, errno, "reading the cartridge's save");
 		return -1;
 	}
-	n = sq_backup_store(c->base, data, size, "cartridge", existed, e);
+	n = sq_backup_store(c->base, data, size, kind, existed, e);
 	free(data);
 	return n;
 }
