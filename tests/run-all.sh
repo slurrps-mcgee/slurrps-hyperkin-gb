@@ -17,6 +17,7 @@
 #   session   sq-session end to end (scripts)
 #   grow      first-boot partition grow on a GPT image (needs sgdisk)
 #   load      loading screen under Xvfb (needs xvfb-run, rsvg-convert)
+#   home      the home screen, headless, driven by scripted buttons
 #
 # The scripts run under busybox built from buildroot/dl with the console's
 # own config, so they meet the same shell and tools as on the console.
@@ -33,7 +34,7 @@ BB_VERSION=1.27.2
 BB_CONFIG="$TOP/buildroot/board/rockchip/common/base/busybox.config"
 JOBS=$(nproc 2> /dev/null || echo 2)
 
-ALL="syntax patches build lib tools config cartevent session grow load"
+ALL="syntax patches build lib tools config cartevent session grow load home"
 GROUPS_TO_RUN="${*:-$ALL}"
 PASSED=""
 FAILED=""
@@ -136,10 +137,10 @@ BuildPrograms(){
 	make -C "$BUILD/src" -s CC=gcc AR=ar CFLAGS="-O2 -Werror" "$@"
 }
 
-if Want build || Want config || Want cartevent || Want session || Want grow || Want load; then
+if Want build || Want config || Want cartevent || Want session || Want grow || Want load || Want home; then
 	Header "build: retronsq programs for the host"
 	if BuildPrograms all 2>&1; then
-		echo "  ok   sqcart, sqload, sqtools_libretro.so"
+		echo "  ok   sqcart, sqload, sqtools_libretro.so, sqhome"
 		Result build 0
 	elif BuildPrograms sqcart 2>&1; then
 		# No SDL here: the script tests only need sqcart
@@ -148,7 +149,7 @@ if Want build || Want config || Want cartevent || Want session || Want grow || W
 	else
 		Result build 1
 	fi
-	export SQCART="$BUILD/src/sqcart" SQLOAD_BIN="$BUILD/src/sqload"
+	export SQCART="$BUILD/src/sqcart" SQLOAD_BIN="$BUILD/src/sqload" SQHOME_BIN="$BUILD/src/sqhome"
 fi
 
 # CTest NAME SOURCE [CFLAGS...]: build a C test with libsqcart's sources
@@ -217,6 +218,13 @@ if Want load && [ -x "${SQLOAD_BIN:-}" ]; then
 elif Want load; then
 	Header "load: skipped, sqload wasn't built"
 	Result load skip
+fi
+
+if [ -x "${SQHOME_BIN:-}" ]; then
+	ScriptTest home "$TESTS/home/test_home.sh"
+elif Want home; then
+	Header "home: skipped, sqhome wasn't built"
+	Result home skip
 fi
 
 echo

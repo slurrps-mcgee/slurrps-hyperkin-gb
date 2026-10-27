@@ -138,6 +138,53 @@ static void clean(void)
 		fprintf(stderr, "failed: %s\n", cmd);
 }
 
+/* A sandbox file as a NUL-terminated string (free it), or NULL */
+static __attribute__((unused)) char* read_text(const char* rel)
+{
+	char p[SQ_PATH_LEN];
+	long size = 0;
+	unsigned char* data;
+	char* text;
+	path(p, rel);
+	data = sq_read_all(p, 1024 * 1024, &size);
+	if (!data)
+		return NULL;
+	text = (char*)malloc(size + 1);
+	if (text) {
+		memcpy(text, data, size);
+		text[size] = '\0';
+	}
+	free(data);
+	return text;
+}
+
+/* --- Gen 3 Pokémon saves ------------------------------------------------ */
+
+static void le32w(uint8_t* p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+
+/* Write a valid slot: 14 sectors, rotated like the game does */
+static void make_slot(uint8_t* save, int slot, uint32_t counter, unsigned seed)
+{
+	int i;
+	srand(seed);
+	for (i = 0; i < 14; i++) {
+		uint8_t* sec = save + (slot * 14 + i) * 0x1000;
+		int id = (i + counter) % 14, j;
+		uint32_t sum = 0;
+		int size = id == 0 ? 3884 : id == 4 ? 3848 : id == 13 ? 2000 : 3968;
+		memset(sec, 0, 0x1000);
+		for (j = 0; j < size; j++)
+			sec[j] = rand() & 0xFF;
+		for (j = 0; j < 3968; j += 4)
+			sum += sec[j] | sec[j + 1] << 8 | sec[j + 2] << 16 | (uint32_t)sec[j + 3] << 24;
+		sec[0xFF4] = id;
+		sec[0xFF6] = (uint16_t)((sum >> 16) + sum) & 0xFF;
+		sec[0xFF7] = (uint16_t)((sum >> 16) + sum) >> 8;
+		le32w(sec + 0xFF8, 0x08012025u);
+		le32w(sec + 0xFFC, counter);
+	}
+}
+
 /* Point libsqcart at the sandbox: $SQ_ROOT, or DEFAULT when it isn't set */
 static void sandbox_init(const char* fallback)
 {

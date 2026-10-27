@@ -10,7 +10,7 @@
  * the end even when there is no screen at all.
  *
  * The slot is a USB 1.1 device (about 1 MB/s), so a big GBA game takes up
- * to ~35 s. The screen says so and shows the time left.
+ * to ~35 s. The screen says so and shows the speed and time left.
  *
  * Testing aids: SQ_ROOT (sandbox paths, see sqcart.h) and
  * SQ_LOADING_SNAPSHOT=<prefix>, which saves <prefix>-50.bmp and
@@ -54,7 +54,7 @@
 #define LOADING_BAR_Y	428
 #define LOADING_BAR_W	616
 #define LOADING_BAR_H	28
-#define LOADING_INFO_X	470	/* "12.0 of 32.0 MB" and "about 20 s left" */
+#define LOADING_INFO_X	470	/* "12.0 of 32.0 MB" and "1.0 MB/s, about 20 s left" */
 #define LOADING_INFO_Y	476
 
 /* --- the copy (background thread) --------------------------------------- */
@@ -66,6 +66,7 @@ static pthread_mutex_t copy_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int copy_finished = 0;
 static volatile int copy_ok = 0;
 static volatile long activity;		/* bumped on every bit of progress */
+static struct sq_meter meter;		/* "8.0 of 16.0 MB", "1.0 MB/s, about 8 s left" */
 
 /* Milliseconds on a monotonic clock (safe from any thread, before SDL) */
 static unsigned long ms_now(void)
@@ -158,15 +159,13 @@ static void fill_capsule(SDL_Renderer* r, int x, int y, int w, int h)
 	}
 }
 
-/* One frame: background, game name, bar, percent, MB and time left */
+/* One frame: background, game name, bar, percent, MB, speed and time left */
 static void draw_loading(SDL_Renderer* r, Uint32 now)
 {
-	static Uint32 speed_start = 0;
-	static long speed_bytes = 0;
 	const SDL_Color white = { 255, 255, 255, 255 };
 	const SDL_Color accent = { 255, 196, 70, 255 };
 	const SDL_Color dim = { 143, 149, 196, 255 };
-	char line[128], name[128];
+	char line[128], name[128], rate[64];
 	long done;
 	double frac;
 	char* p;
@@ -202,27 +201,11 @@ static void draw_loading(SDL_Renderer* r, Uint32 now)
 		fill_capsule(r, LOADING_BAR_X + 4, LOADING_BAR_Y + 4, w - 8, LOADING_BAR_H / 3);
 	}
 
-	snprintf(line, sizeof(line), "%.1f of %.1f MB", done / 1048576.0, total_size / 1048576.0);
+	/* "8.0 of 16.0 MB" on the left, "1.0 MB/s, about 8 s left" on the
+	 * right: the same words as the home screen and Cartridge Tools */
+	sq_meter_text(&meter, done, now, copy_finished, line, sizeof(line), rate, sizeof(rate));
 	draw_text(r, font_info, &text_size, line, LOADING_INFO_X, LOADING_INFO_Y, dim, 0);
-
-	/* Time left from the measured speed, once 1.5 s of data has arrived */
-	if (done > 0 && speed_start == 0) {
-		speed_start = now;
-		speed_bytes = done;
-	}
-	if (copy_finished) {
-		snprintf(line, sizeof(line), "Done");
-	} else if (speed_start && now - speed_start > 1500 && done > speed_bytes) {
-		double rate = (done - speed_bytes) * 1000.0 / (now - speed_start);
-		int left = (int)((total_size - done) / rate + 0.5);
-		if (left >= 60)
-			snprintf(line, sizeof(line), "about %d min %02d s left", left / 60, left % 60);
-		else
-			snprintf(line, sizeof(line), "about %d s left", left < 1 ? 1 : left);
-	} else {
-		snprintf(line, sizeof(line), "Measuring speed...");
-	}
-	draw_text(r, font_info, &text_time, line, LOADING_RIGHT, LOADING_INFO_Y, dim, 1);
+	draw_text(r, font_info, &text_time, rate, LOADING_RIGHT, LOADING_INFO_Y, dim, 1);
 }
 
 /* With SQ_LOADING_SNAPSHOT=<prefix> set, save the screen as <prefix>-<suffix>.bmp */
@@ -360,6 +343,7 @@ int main(void)
 	/* The save is only copied when there is no live save yet */
 	sq_cart_cache_path(&cart, ".srm", path, sizeof(path));
 	total_size = cart.rom_size + (sq_file_size(path) < 0 ? cart.save_size : 0);
+	sq_meter_start(&meter, total_size);
 
 	/* Start reading the cartridge right away; the screen (EGL, SDL, PNG
 	 * decode) gets set up while the first megabytes are already copying */

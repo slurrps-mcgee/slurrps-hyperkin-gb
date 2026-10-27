@@ -64,6 +64,7 @@ for PAIR in rockchip/partinit/S21mountall.sh:etc/init.d/S21mountall.sh \
 		retronsq/scripts/S50ui:etc/init.d/S50ui \
 		retronsq/udev/90-retronsq-cart.rules:lib/udev/rules.d/90-retronsq-cart.rules \
 		retronsq/config/retroarch-cfw.cfg:usr/share/retronsq/retroarch-cfw.cfg \
+		retronsq/config/defaults.cfg:usr/share/retronsq/defaults.cfg \
 		$(cd $PKGS/retronsq/scripts && for F in *; do
 			[ $F = S50ui ] || echo retronsq/scripts/$F:usr/lib/retronsq/$F; done); do
 	cmp -s $PKGS/${PAIR%%:*} $TARGET/${PAIR#*:} || STALE="$STALE ${PAIR#*:}"

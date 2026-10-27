@@ -1,6 +1,7 @@
 #!/bin/sh
 #
-# sq-session end to end: boot with and without a cartridge, hot-plugging
+# sq-session end to end: boot with and without a cartridge, the home screen
+# and what it hands over, hot-plugging
 # while a game or the menu runs, CART_AUTOLOAD, Cartridge Tools' "Play
 # cartridge", the reset button, a RetroArch that won't quit, a cartridge
 # that can't be read. RetroArch and sqload are stubs (stubs/); everything
@@ -10,12 +11,15 @@
 . "$(dirname "$0")/sandbox.sh"
 
 # Start sq-session as S50ui would, in the background, as if the console was
-# just switched on (SQ_BOOT_T0), waiting at most 5 s for a cartridge
+# just switched on (SQ_BOOT_T0), waiting at most 5 s for a cartridge. The
+# first scenarios use RetroArch's menu as the start screen (UI=retroarch);
+# the home screen ones set TEST_UI=home.
 StartTestSession(){
 	local up
 	up=$(cut -d ' ' -f 1 /proc/uptime)
 	export SQ_BOOT_T0=${up%.*}
 	SetCfg CART_WAIT 5
+	SetCfg UI "${TEST_UI:-retroarch}"
 	"$LIB_DIR/sq-session" > "$R/session.out" 2>&1 &
 }
 
@@ -174,5 +178,93 @@ LoadMedium Tetris.gb 32768
 CartEvent add
 Check "a cartridge still starts" WaitFor 8 RaLastHas "Tetris.gb"
 Check "with the GB core" RaLastHas "vbam_libretro.so"
+
+# --- the home screen (UI=home, the default) ------------------------------------
+
+export TEST_UI=home
+GAME=/userdata/roms/gba/Golden_Sun.gba
+
+echo "home screen: boot without a cartridge"
+NewSandbox
+mkdir -p "$R/userdata/roms/gba" "$R/sys/class/graphics/fb0" "$R/dev"
+echo x > "$R$GAME"
+# A tiny console framebuffer still showing "the splash"
+echo 4,3 > "$R/sys/class/graphics/fb0/virtual_size"
+echo 32 > "$R/sys/class/graphics/fb0/bits_per_pixel"
+head -c 48 /dev/urandom | tr '\0' x > "$R/dev/fb0"
+StartTestSession
+Check "the home screen starts" WaitFor 10 HomeStartedAtLeast 1
+Check "mode is home" Equal "$(cat "$MODE_FILE")" home
+Check "RetroArch isn't started" Equal "$(RaRuns)" 0
+Check "the splash is cleared once the home screen is up" WaitFor 8 eval \
+	'[ "$(stat -c %s "$R/dev/fb0")" = 48 ] && [ -z "$(tr -d "\\000" < "$R/dev/fb0")" ]'
+
+echo "home screen: play a game from the SD card"
+HomeAsks "ACTION=game|ROM=$GAME|LABEL=Golden Sun"
+Check "RetroArch plays it" WaitFor 5 RaLastHas "$R$GAME"
+Check "with the GBA core" RaLastHas "gpsp_libretro.so"
+Check "Close Content returns home (RETRONSQ_CLOSE_QUITS=1)" Equal "$(tail -n 1 "$R/ra-env")" "close=1"
+Check "mode is game" Equal "$(cat "$MODE_FILE")" game
+Check "the request is used up" test ! -f "$RUN_DIR/home-request"
+
+echo "home screen: the reset button restarts the same game"
+RUNS=$(RaRuns)
+"$LIB_DIR/reset-btn"
+Check "the same game again" WaitFor 6 RaStartedAtLeast $((RUNS + 1))
+Check "not the home screen" Equal "$(HomeRuns)" 1
+Check "same game" RaLastHas "$R$GAME"
+
+echo "home screen: leaving the game"
+kill $(cat "$R/fake-ra.pid")
+Check "back to the home screen" WaitFor 5 HomeStartedAtLeast 2
+
+echo "home screen: refuses what isn't a game"
+for bad in /etc/passwd /userdata/../etc/passwd /userdata/retronsq.cfg; do
+	HomeAsks "ACTION=game|ROM=$bad|LABEL=x"
+done
+Check "three refused requests, back home each time" WaitFor 8 HomeStartedAtLeast 5
+Check "RetroArch never ran them" eval '! grep -q "passwd\|retronsq.cfg" "$R/ra-calls"'
+Check "logged" Contains "$LOG_DIR/launcher.log" "home screen: not a game file: /etc/passwd"
+
+echo "home screen: RetroArch's settings"
+HomeAsks "ACTION=retroarch"
+Check "RetroArch's menu" WaitFor 5 RaLastHas "--menu"
+Check "where Close Content behaves as usual" Equal "$(tail -n 1 "$R/ra-env")" "close="
+kill $(cat "$R/fake-ra.pid")
+Check "then home again" WaitFor 5 HomeStartedAtLeast 6
+
+echo "home screen: a cartridge inserted (auto-load on)"
+LoadMedium Pokemon_Emerald.gba 262144 131072
+CartEvent add
+Check "the home screen is stopped" WaitFor 5 Contains "$R/home-events" "TERM"
+Check "the cartridge plays" WaitFor 8 RaLastHas "Pokemon_Emerald.gba"
+Check "and is in Recently played" Contains "$R/userdata/home/history.txt" "/userdata/rom/Pokemon_Emerald.gba"
+HOMES=$(HomeRuns)
+kill $(cat "$R/fake-ra.pid")
+Check "leaving its game goes home, not into the game again" WaitFor 5 HomeStartedAtLeast $((HOMES + 1))
+usleep 1500000
+Check "still home" eval 'HomeRunning && ! RaLastHas "Pokemon_Emerald.gba"'
+
+echo "home screen: Play cartridge"
+HomeAsks "ACTION=cart"
+Check "the cartridge plays again" WaitFor 8 RaLastHas "Pokemon_Emerald.gba"
+kill $(cat "$R/fake-ra.pid")
+Check "home again" WaitFor 5 HomeRunning
+
+echo "home screen: restart and power off"
+HomeAsks "ACTION=reboot"
+Check "restart" WaitFor 5 Contains "$R/calls.log" "reboot"
+HomeAsks "ACTION=poweroff"
+Check "power off" WaitFor 5 Contains "$R/calls.log" "poweroff"
+
+echo "home screen: auto-load off"
+NewSandbox
+SetCfg CART_AUTOLOAD 0
+StartTestSession
+Check "the home screen starts" WaitFor 10 HomeStartedAtLeast 1
+LoadMedium Tetris.gb 32768
+CartEvent add
+usleep 1500000
+Check "an inserted cartridge leaves it alone" eval 'HomeRunning && [ ! -s "$R/home-events" ]'
 
 Done

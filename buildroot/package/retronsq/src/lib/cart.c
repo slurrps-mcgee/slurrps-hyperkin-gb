@@ -129,11 +129,19 @@ static int is_rom(const char* name)
 static void header_text(char* out, const unsigned char* in, int n)
 {
 	int i;
-	for (i = 0; i < n && in[i]; i++)
-		out[i] = (in[i] >= 0x20 && in[i] < 0x7F) ? (char)in[i] : '?';
+	/* Titles are upper-case letters, digits and a little punctuation. Stop
+	 * at anything else (GBC titles end in a flag byte), and drop a "title"
+	 * of fewer than 3 characters: that is a garbled or blank header, not a
+	 * name to show. */
+	for (i = 0; i < n && in[i] && (strchr(" .,!&'_:+-", in[i]) ||
+			(in[i] >= '0' && in[i] <= '9') || (in[i] >= 'A' && in[i] <= 'Z') ||
+			(in[i] >= 'a' && in[i] <= 'z')); i++)
+		out[i] = (char)in[i];
 	out[i] = '\0';
 	while (i > 0 && out[i - 1] == ' ')
 		out[--i] = '\0';
+	if (i < 3)
+		out[0] = '\0';
 }
 
 void sq_rom_header(const char* path, char title[17], char code[5])

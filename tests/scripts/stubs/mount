@@ -1,19 +1,41 @@
 #!/bin/sh
 # Test stub for mount: "mounts" a fake device by copying its files
 # ($SQ_ROOT/fakedev/<dev>/) into the mount point and adding the line the
-# kernel would add to the sandbox's /proc/mounts.
+# kernel would add to the sandbox's /proc/mounts. A read-only mount makes
+# the files read-only, so a write that skipped write-enable fails as it
+# would on the console.
 #   mount -t TYPE -o OPTS /dev/DEV DIR
-while [ $# -gt 2 ]; do
+#   mount -o remount,OPTS DIR
+while [ $# -gt 1 ]; do
 	case "$1" in
 		-t) type=$2; shift 2 ;;
 		-o) opts=$2; shift 2 ;;
 		*) break ;;
 	esac
 done
+case "$opts" in
+	remount,*)
+		dir=$1
+		echo "mount -o $opts $dir" >> "$SQ_ROOT/calls.log"
+		grep -q " $dir " "$SQ_ROOT/proc/mounts" || { echo "mount: $dir: not mounted" >&2; exit 1; }
+		[ -f "$SQ_ROOT/remount-fails" ] && { echo "mount: $dir: busy" >&2; exit 1; }
+		new=${opts#remount,}
+		awk -v d="$dir" -v o="$new" '$2 == d { $4 = o } { print }' "$SQ_ROOT/proc/mounts" > "$SQ_ROOT/proc/mounts.new"
+		mv "$SQ_ROOT/proc/mounts.new" "$SQ_ROOT/proc/mounts"
+		case ",$new," in
+			*,rw,*) chmod -R u+w "$dir" ;;
+			*) chmod -R a-w "$dir"; chmod u+w "$dir" ;;
+		esac
+		exit 0
+		;;
+esac
 dev=$1 dir=$2
 echo "mount $type $opts $dev $dir" >> "$SQ_ROOT/calls.log"
 src="$SQ_ROOT/fakedev/${dev##*/}"
 [ -d "$src" ] || { echo "mount: $dev: no medium" >&2; exit 32; }
 mkdir -p "$dir"
 cp -a "$src/." "$dir/"
+case ",$opts," in
+	*,ro,*) chmod -R a-w "$dir"; chmod u+w "$dir" ;;
+esac
 echo "$dev $dir ${type:-vfat} ${opts:-rw} 0 0" >> "$SQ_ROOT/proc/mounts"

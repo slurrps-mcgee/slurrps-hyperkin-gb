@@ -1,0 +1,16 @@
+#!/bin/sh
+# Test stub for sqhome, the home screen: records that it ran, then hands
+# sq-session the next request the test queued in $SQ_ROOT/home-next (one
+# per line, fields split by "|": ACTION=game|ROM=/userdata/...), or stays
+# up until stopped (SIGTERM, as KillGame does) when none is queued.
+echo "sqhome" >> "$SQ_ROOT/calls.log"
+echo $$ > "$SQ_ROOT/fake-home.pid"
+trap 'echo TERM >> "$SQ_ROOT/home-events"; exit 0' TERM
+while :; do
+	if [ -s "$SQ_ROOT/home-next" ]; then
+		head -n 1 "$SQ_ROOT/home-next" | tr '|' '\n' > "$SQ_ROOT/run/retronsq/home-request"
+		sed -i 1d "$SQ_ROOT/home-next"
+		exit 0
+	fi
+	usleep 100000
+done

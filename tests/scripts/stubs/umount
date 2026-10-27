@@ -6,5 +6,6 @@ echo "umount $1" >> "$SQ_ROOT/calls.log"
 grep -q " $1 " "$SQ_ROOT/proc/mounts" || { echo "umount: $1: not mounted" >&2; exit 1; }
 grep -v " $1 " "$SQ_ROOT/proc/mounts" > "$SQ_ROOT/proc/mounts.new"
 mv "$SQ_ROOT/proc/mounts.new" "$SQ_ROOT/proc/mounts"
+chmod -R u+w "$1" 2> /dev/null
 rm -rf "$1"/* "$1"/.[!.]* 2> /dev/null
 exit 0

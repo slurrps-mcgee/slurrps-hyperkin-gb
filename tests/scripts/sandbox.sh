@@ -4,7 +4,7 @@
 # console, with the firmware scripts installed where they are on the device,
 # a fake cartridge reader in a fake sysfs, a fake /proc/mounts, and stubs
 # for the commands that need real hardware (stubs/: mount, umount, hdparm,
-# amixer, retroarch, sqload). The firmware scripts find it through
+# amixer, retroarch, sqload, sqhome, reboot, poweroff). The firmware scripts find it through
 # $SQ_ROOT, exactly as on the console with an empty $SQ_ROOT.
 #
 # Expected environment (set by tests/run-all.sh):
@@ -77,7 +77,8 @@ NewSandbox(){
 	SQ_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/sqtest.XXXXXX")
 	export SQ_ROOT
 	export SQ_CONSOLE="$SQ_ROOT/console.log"
-	export SQCART SQLOAD="$SQ_ROOT/bin/sqload" RETROARCH_BIN="$SQ_ROOT/bin/retroarch"
+	export SQCART SQLOAD="$SQ_ROOT/bin/sqload" RETROARCH_BIN="$SQ_ROOT/bin/retroarch" \
+		SQHOME="$SQ_ROOT/bin/sqhome"
 	local d
 	for d in bin proc tmp run/retronsq media/cart usr/lib/retronsq \
 			usr/lib/libretro usr/share/retronsq userdata/rom userdata/roms \
@@ -97,7 +98,7 @@ NewSandbox(){
 		chmod +x "$SQ_ROOT/bin/${f##*/}"
 	done
 	export PATH="$SQ_ROOT/bin:$BASE_PATH"
-	cp "$SRC/config/retroarch-cfw.cfg" "$SQ_ROOT/usr/share/retronsq/"
+	cp "$SRC/config/retroarch-cfw.cfg" "$SRC/config/defaults.cfg" "$SQ_ROOT/usr/share/retronsq/"
 	touch "$SQ_ROOT/usr/share/retronsq/cartridge-tools.sqt"
 	for core in gpsp mgba vbam sqtools; do
 		touch "$SQ_ROOT/usr/lib/libretro/${core}_libretro.so"
@@ -140,14 +141,17 @@ SandboxPids(){
 
 PORT_BLOCK=sys/bus/usb/devices/3-1/3-1:1.1/host0/target0:0:0/0:0:0:0/block
 
-# PlugReader: the reader shows up on USB with no cartridge (disk size 0)
+# PlugReader: the reader shows up on USB with no cartridge (disk size 0).
+# Its drive isn't write protected unless READER_WP=1.
 PlugReader(){
 	mkdir -p "$SQ_ROOT/$PORT_BLOCK/sda" "$SQ_ROOT/sys/class/block/sda"
 	echo 0 > "$SQ_ROOT/sys/class/block/sda/size"
+	[ -f "$SQ_ROOT/sys/class/block/sda/ro" ] || echo "${READER_WP:-0}" > "$SQ_ROOT/sys/class/block/sda/ro"
 }
 
 # UnplugReader: the reader disappears from USB
 UnplugReader(){
+	chmod -R u+w "$SQ_ROOT/media/cart" 2> /dev/null
 	rm -rf "$SQ_ROOT/sys/bus/usb/devices/3-1" "$SQ_ROOT/sys/class/block/sda"
 }
 
@@ -218,4 +222,26 @@ RaStartedAtLeast(){
 # RaLastHas TEXT: the running RetroArch was started with TEXT in its args
 RaLastHas(){
 	RaRunning && RaLast | grep -qF -- "$1"
+}
+
+# --- The fake home screen ----------------------------------------------------------
+
+# HomeRuns: how many times the home screen was started
+HomeRuns(){
+	grep -c "^sqhome$" "$SQ_ROOT/calls.log" 2> /dev/null || echo 0
+}
+
+HomeRunning(){
+	[ -f "$SQ_ROOT/fake-home.pid" ] && kill -0 $(cat "$SQ_ROOT/fake-home.pid") 2> /dev/null
+}
+
+# HomeStartedAtLeast N
+HomeStartedAtLeast(){
+	[ $(HomeRuns) -ge $1 ] && HomeRunning
+}
+
+# HomeAsks REQUEST: what the home screen hands over the next time
+# (ACTION=game|ROM=/userdata/roms/gba/X.gba|LABEL=X)
+HomeAsks(){
+	echo "$1" >> "$SQ_ROOT/home-next"
 }

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Test stub: records that the console would restart
+echo "reboot" >> "$SQ_ROOT/calls.log"

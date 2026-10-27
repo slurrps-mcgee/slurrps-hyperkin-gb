@@ -12,9 +12,9 @@ printf 'GBA_CORE = "mgba"\r\nCART_AUTOLOAD=0\r\n' >> "$SQ_CFG"
 Check "CRLF, spaces and quotes from PC editors" Equal "$(CfgGet GBA_CORE)" mgba
 Check "last occurrence wins" Equal "$(CfgGet CART_AUTOLOAD)" 0
 rm "$SQ_CFG"
-Check "defaults without a settings file" Equal "$(CfgGet CART_AUTOLOAD)/$(CfgGet CART_WAIT)" "1/25"
+Check "defaults without a settings file" Equal "$(CfgGet CART_AUTOLOAD)/$(CfgGet CART_WAIT)" "1/15"
 SetCfg CART_WAIT abc
-Check "non-numeric number falls back to its default" Equal "$(CfgNum CART_WAIT 120)" 25
+Check "non-numeric number falls back to its default" Equal "$(CfgNum CART_WAIT 120)" 15
 SetCfg CART_WAIT 9999
 Check "numbers are capped" Equal "$(CfgNum CART_WAIT 120)" 120
 

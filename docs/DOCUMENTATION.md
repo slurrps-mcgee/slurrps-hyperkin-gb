@@ -9,6 +9,7 @@ testing), see [DEVELOPING.md](DEVELOPING.md).
 - [The pieces](#the-pieces)
 - [Boot sequence](#boot-sequence)
 - [The session](#the-session)
+- [The home screen](#the-home-screen)
 - [Cartridges](#cartridges)
 - [Saves](#saves)
 - [Cartridge Tools](#cartridge-tools)
@@ -48,7 +49,8 @@ exposes the inserted cartridge as a small FAT drive with three files:
 The firmware copies the ROM to the SD card and runs it in an emulator
 (RetroArch with a libretro core). Everything else follows from that.
 
-**The cartridge is only ever read.** See
+**The cartridge is only read**, with one deliberate exception: Cartridge
+Tools' *Write a save to the cartridge*, which the user asks for. See
 [The cartridge is read-only](#the-cartridge-is-read-only).
 
 ## The pieces
@@ -63,6 +65,7 @@ flowchart TD
         SQL[sqload<br/>loading screen] --> L
         SQC[sqcart<br/>command line] --> L
         SQT[sqtools_libretro.so<br/>Cartridge Tools] --> L
+        SQH[sqhome<br/>home screen] --> L
     end
     subgraph S["Shell (scripts/)"]
         CO[common.sh<br/>shared functions]
@@ -76,17 +79,23 @@ flowchart TD
     CO -->|first copy| SQL
     U[udev rule] --> CE
     SE -->|starts| RA[RetroArch]
+    SE -->|starts| SQH
+    SQH -.->|request: what to play| SE
     RA -->|loads| SQT
 ```
 
 - **libsqcart** (`src/lib/`, header `sqcart.h`) is the one implementation
   of cartridge handling: reader state, the reader's CRC, the pipelined
   verified copy, atomic writes, save import, backups and the Gen 3 Pokémon
-  save checker. Every path goes through `sq_path()`, which prefixes
+  save checker. It also holds what the home screen and Cartridge Tools
+  share: the cartridge actions as the user sees them (`sq_do_*`), settings
+  (`sq_cfg_get`/`sq_cfg_set`) and the game library (scan, history,
+  favorites, box art). Every path goes through `sq_path()`, which prefixes
   `$SQ_ROOT`, so tests run it against a sandbox.
-- **sqload**, **sqcart** and **Cartridge Tools** are thin programs on top of
-  it, so the shell scripts, the loading screen and the tools can't disagree
-  about what a cartridge is or how it's copied.
+- **sqhome**, **sqload**, **sqcart** and **Cartridge Tools** are programs
+  on top of it, so the home screen, the shell scripts, the loading screen
+  and the tools can't disagree about what a cartridge is or how it's
+  copied.
 - **The shell scripts** are glue: they decide *when* things happen (boot,
   hot-plug, reset) and run RetroArch.
 
@@ -136,33 +145,43 @@ flowchart TD
      15 s past the deadline, and runs `cart-event reconcile` once a second
      in case the udev event came before anything could handle it;
    - `none` or `empty` only count as "no cartridge" once `CART_WAIT`
-     seconds (25) have passed since power-on.
+     seconds (15) have passed since power-on.
+
+   The trade-off: a higher `CART_WAIT` keeps the splash up longer for a
+   slow cartridge, but every boot without a cartridge waits that long too.
+   If the reader is slower than `CART_WAIT`, the home screen shows and the
+   cartridge takes over as soon as it appears, like a hot-plug.
 
    Every change of state is logged with its time since power-on
-   (`boot: cartridge reader ready at 17.40 s`), then the result. If the
-   reader is slower than `CART_WAIT`, the menu starts and the cartridge
-   takes over as soon as it appears, like a hot-plug.
+   (`boot: cartridge reader ready at 17.40 s`), then the result. With
+   `boot: splash up`, `boot: session started` and `home screen` in
+   `launcher.log`, and each storage step's start and end in `boot.log`,
+   the whole boot can be timed from the SD card.
 
 ## The session
 
 `sq-session` (`scripts/sq-session`) is a loop that keeps **exactly one**
-RetroArch running for as long as the console is on:
+thing on screen (RetroArch or the home screen) for as long as the console
+is on:
 
 ```mermaid
 flowchart TD
     L[Loop] --> S{Screen connected?}
     S -- no --> W[wait 1 s] --> L
-    S -- yes --> C{Cartridge ready, not failed,<br/>and CART_AUTOLOAD=1<br/>or Play cartridge asked?}
+    S -- yes --> C{Cartridge ready, not failed,<br/>and just inserted with CART_AUTOLOAD=1<br/>or Play cartridge asked?}
     C -- yes --> P[PrepareCart]
     P -- ok --> RC[LaunchCart: RetroArch -L core rom]
     P -- failed --> F{failed twice?}
     F -- yes --> X[mark failed, menu next] --> L
     F -- no --> L
     C -- no --> M{NO_CART=menu?}
-    M -- yes --> RM[LaunchMenu: sq-scan-roms, RetroArch --menu]
+    M -- yes --> U{UI}
+    U -- home --> H[LaunchHome: sqhome,<br/>then what it asked for]
+    U -- retroarch --> RM[LaunchMenu: sq-scan-roms, RetroArch --menu]
     M -- no --> W
     RC --> E[RetroArch exited] --> L
     RM --> E
+    H --> E
 ```
 
 RetroArch runs in the foreground of the loop. When it exits for any reason
@@ -205,8 +224,17 @@ Details:
 - **Failed cartridges.** If a cartridge fails to load twice (unreadable,
   pulled mid-copy), `/run/retronsq/cart-failed` is set and the menu runs
   instead until a cartridge is inserted again or *Play cartridge* is chosen.
-- **`/run/retronsq/mode`** holds `cart` or `menu`, so a removal only stops
-  RetroArch when it runs the cartridge.
+- **`/run/retronsq/mode`** holds `cart`, `game` (from the SD card),
+  `home` or `menu`, so a removal only stops RetroArch when it runs the
+  cartridge, and the reset button knows what to restart.
+- **Auto-load is once per insert.** `LaunchCart` sets
+  `/run/retronsq/cart-played`; inserting (or swapping, or pulling) a
+  cartridge clears it. So leaving a cartridge's game goes to the home
+  screen instead of straight back into the game. The reset button asks for
+  the same game again (`play-cart` for a cartridge, `replay` for an SD card
+  game).
+- **Back-off counts crashes only.** The home screen handing over a request
+  resets the quick-exit counter: it's working, not dying.
 - **Firmware RetroArch settings.** RetroArch always starts with
   `-c /userdata/retroarch/retroarch.cfg --appendconfig=/usr/share/retronsq/retroarch-cfw.cfg`.
   The second file holds the settings the firmware depends on
@@ -214,6 +242,96 @@ Details:
   cards set up by an older firmware or changed in the menu. (RetroArch
   replaces the appended file with a core or game override file when one
   exists, so overrides should not change these two settings.)
+
+## The home screen
+
+`src/home/` (`sqhome`): the start screen with `UI=home` (the default). A
+small SDL2 program, built to be light on the RK3128:
+
+- **Draws only when something changed** and otherwise sleeps in
+  `SDL_WaitEventTimeout`, waking twice a second to rescan the cartridge
+  (`sq_cart_scan`: `/proc/mounts` and two sysfs files). No animation loop.
+- **Text is cached:** every rendered string is kept as a texture (128
+  entries, least recently used dropped). FreeType runs only when a new
+  string appears.
+- **Box art loads lazily:** only for the selected game, 150 ms after the
+  cursor stops, one image held at a time (`sq_boxart_path`). First a PNG
+  next to the game with its name (`roms/gba/Golden Sun.png`), else
+  RetroArch's own layout,
+  `retroarch/thumbnails/<system>/Named_Boxarts/<label>.png` with
+  `` &*/:`<>?\| `` in the name replaced by `_`, so libretro-thumbnails packs
+  work unchanged.
+- **1280×720 logical size**, scaled by SDL to the screen. On the console:
+  KMSDRM and GLES2, HDMI chosen with `SDL_MONITOR_INDEX=1` (like `sqload`);
+  software rendering if GL fails.
+
+**Pages** (left): Cartridge, Recently played, Favorites, Game Boy Advance,
+Game Boy Color, Game Boy, Cartridge dumps, Settings. It opens on the
+Cartridge page when a cartridge is in, else on Recently played (or Game
+Boy Advance when nothing was played yet).
+
+| Data | Where |
+| --- | --- |
+| Games | `sq_library_scan`: `roms/` recursively (system from the extension, a `.zip` by its folder), sorted by name; `rom/` for Cartridge dumps |
+| Recently played | `home/history.txt` (`path<TAB>label`, newest first, 30 kept). sqhome adds a game when it starts it; `LaunchCart` adds cartridges with `sqcart history-add` |
+| Favorites | `home/favorites.txt`, toggled with Y |
+| Settings | `retronsq.cfg` through `sq_cfg_set`: the line is replaced in place, the rest of the file and its comments kept |
+
+Entries whose file is gone are skipped, so games deleted on a PC disappear
+by themselves.
+
+**Starting things.** The home screen never starts anything itself. It
+writes `/run/retronsq/home-request`:
+
+```
+ACTION=game
+ROM=/userdata/roms/gba/Golden Sun.gba
+LABEL=Golden Sun
+```
+
+and exits. sq-session's `RunHomeRequest` then does it: `game` (only a
+`.gb/.gbc/.gba/.zip` under `/userdata`, no `..`; core by `CoreForRom` for
+`rom/`, the system's otherwise), `cart` (play the cartridge), `retroarch`
+(RetroArch's menu), `reboot`, `poweroff`. Games started this way run with
+`RETRONSQ_CLOSE_QUITS=1`: RetroArch patch 0004 makes *Close Content* quit
+(normally, saving) so the game returns home.
+
+**The splash only at power-on.** The boot splash is drawn on the console
+framebuffer, which the display falls back to whenever no program holds
+it (between the loading screen and a game, a game and the home screen).
+sq-session clears it (`BlankFramebuffer`) 4 s after starting the first
+program, so later switches go through black.
+
+**Input.** `input.c` maps pads with RetroArch's own autoconfig files
+(`retroarch/autoconfig/*.cfg`, matched by USB vendor/product id, then by
+name). RetroArch's udev joypad driver and SDL's Linux joystick code number
+buttons and axes the same way, so `Hyperkin_SQ.cfg`'s numbers mean the same
+here and both agree. A pad without a file gets a common layout. The
+keyboard works too (arrows, Enter, Backspace). Directions and L/R repeat
+when held. Each pad event is judged by its own value, not by the pad's
+current state: a quick tap's press and release can arrive in one batch,
+and reading the state would lose the press.
+
+**Cartridge page.** The same actions as Cartridge Tools (below), from the
+same code (`sq_do_*` in `src/lib/actions.c`), run in a worker thread. A
+copy shows percent, MB copied, speed and time left: libsqcart's
+`sq_meter_text`, which the loading screen and the tools core use too, so all
+three say the same.
+
+**Dialogs** have real buttons: questions *No* and *Yes* (or *Write it*),
+picked with Left/Right and pressed with A, with *No* selected first; B is
+always *No*. Messages have an *OK* button. The tools core does the same on
+its small screen.
+
+**First frames.** On the console's display (KMSDRM, Mali) a frame only
+shows once more frames follow, and this screen otherwise draws once and
+sleeps. So every change is presented three times, 33 ms apart, and for the
+first 1.5 s after the home screen starts (the TV may still be switching
+mode after RetroArch) a frame is presented every 100 ms. Inserting a cartridge with auto-load on stops the home screen
+(one SIGTERM, like RetroArch) so the cartridge starts.
+
+**Stopping.** SIGTERM (KillGame) ends it at once; an action in progress is
+finished first. SDL's shutdown gets 5 s.
 
 ## Cartridges
 
@@ -314,12 +432,56 @@ of the inserted cartridge:
 Two independent locks keep anything from writing to a cartridge:
 
 1. **Block device.** `cart-event` runs `hdparm -r1` on the reader's disk
-   before mounting. The kernel then refuses every write to it, whoever
-   tries.
+   (and the partition, if the cartridge is mounted from one: on this
+   kernel the flag is per block device) before mounting. The kernel then
+   refuses every write to it, whoever tries.
 2. **Mount.** `/media/cart` is mounted `ro`.
 
-Nothing in the firmware tries to write there anyway: libsqcart opens the
-reader's files read-only. The locks make sure it stays that way.
+Nothing in the firmware writes there, except one function:
+`sq_write_cart_save` (`src/lib/cartwrite.c`), used only by Cartridge Tools'
+*Write a save to the cartridge*.
+
+### Writing a save to the cartridge (experimental)
+
+The stock firmware never wrote to cartridges, and whether the reader's
+firmware passes writes to its FAT drive on to the cartridge's save chip is
+unknown. So the write is opt-in, checked at every step, and logged:
+
+1. **Write protection.** Before `cart-event` first locks a newly attached
+   drive, it records the drive's own read-only flag in
+   `/run/retronsq/reader-wp` (the kernel sets it when the device reports
+   write protection) and logs it. A write-protected reader is refused.
+2. **Checks that change nothing:** the save must be exactly the size of
+   the cartridge's `.sav`, and a Gen 3 Pokémon save must have a valid slot.
+3. **Backup:** the cartridge's current save is backed up
+   (`sq_backup_cart_save`) before anything is unlocked.
+4. **Unlock:** `cart-event write-enable` clears the read-only flags and
+   remounts `/media/cart` read-write, under the same lock as hot-plug
+   events.
+5. **Write in place:** `sq_write_cart_save` opens the `.sav` without
+   truncating and overwrites it with the same number of bytes, then
+   fsyncs. No new file, no size change: the drive's FAT and directory stay
+   as they are, only the save file's data sectors are written.
+6. **Lock:** `cart-event write-disable` syncs, remounts read-only and sets
+   the read-only flags again. A mount that can't be switched back is
+   replaced by a fresh read-only one (same device, so no insert or removal
+   is reported).
+7. **Check:** the save is read back with `O_DIRECT` (or with its cached
+   pages dropped), so what is compared is what the reader returns.
+
+Every step goes to `launcher.log` (`tools:` and `cartridge:` lines).
+
+8. **Checked again at re-insert.** The read-back in step 7 can be answered
+   from the reader's own memory: it proves the slot took the write, not
+   that the cartridge has it. So a successful write is remembered in
+   `home/cart-write-check` on the SD card (ROM name and size, save size and
+   CRC; it survives a power-off) and the user is told to take the
+   cartridge out and put it back. The next time that cartridge is
+   inserted, `sq_write_check` compares its save: "Your save is on the
+   cartridge" or "The cartridge still has its old save". The session runs
+   it in `PrepareCart` (`sqcart write-check`, logged as `write check:`
+   lines; the home screen shows the verdict when it next opens), and the
+   home screen runs it itself when a cartridge appears on it.
 
 ### The copy
 
@@ -482,12 +644,15 @@ save checks bad, the cartridge (or its read) is.
 
 ## Cartridge Tools
 
-`src/tools/sqtools.c`
+The cartridge actions are in libsqcart (`src/lib/actions.c`: what each
+does, in which order, and the lines telling the user how it went), shown
+by two front ends: the home screen's Cartridge page, and, for `UI=retroarch`,
+`src/tools/sqtools.c`.
 
 RetroArch 1.7.4 has no plugin or script hooks for its menu, and patching its
-menu code is invasive. So the tools are a **libretro core**: RetroArch loads
-it like a game, and it draws its own screen (320×240, RGB565, RetroArch's
-RGUI font) and reads the pad. All cartridge work is libsqcart's.
+menu code is invasive. So the RetroArch version of the tools is a
+**libretro core**: RetroArch loads it like a game, and it draws its own
+screen (320×240, RGB565, RetroArch's RGUI font) and reads the pad.
 
 - **Opening it.** `sq-scan-roms` writes a one-entry playlist, *Cartridge
   Tools*. It points at `/usr/share/retronsq/cartridge-tools.sqt` with
@@ -505,10 +670,11 @@ RGUI font) and reads the pad. All cartridge work is libsqcart's.
 
 | Action | Implementation |
 | --- | --- |
-| Play cartridge | Writes `/run/retronsq/play-cart`, clears `cart-failed`, and sends RetroArch SIGTERM (a clean exit). sq-session sees the request and plays the cartridge, even with `CART_AUTOLOAD=0`. |
+| Play cartridge | Tools core: writes `/run/retronsq/play-cart`, clears `cart-failed`, and sends RetroArch SIGTERM (a clean exit). Home screen: the `cart` request. Either way sq-session plays the cartridge, even with `CART_AUTOLOAD=0`. |
 | Copy cartridge to SD card | `sq_dump_to_library`: copies the ROM to `roms/<system>/<name>`, verified against the reader's CRC (a mismatch is retried once). A verified copy in `rom/` is used as the source when there is one (same data, much faster). If the library already has that game (same size and CRC), nothing is copied. A different game with the same name becomes `<name> (2)`. The save comes along as `<name>.srm` (the live save if there is one, else the cartridge's). Then `sq-scan-roms` runs so it shows in Collections at once. |
 | Back up cartridge save | `sq_backup_cart_save`: `saves/<game>/NNN-cartridge.sav`, unless an identical backup exists. |
 | Restore a save... | Lists the cartridge's current save and every backup, newest first. On confirm, `sq_restore_save` backs up the live save as `NNN-before-restore.sav` (if not already backed up), then writes the chosen save as the live save. |
+| Write a save to the cartridge... | Experimental. Lists the live save and every backup; asks twice. Then the steps in [Writing a save to the cartridge](#writing-a-save-to-the-cartridge-experimental). `cart-event` is run as `CART_RW_CMD`, which the tests replace. |
 | Back to RetroArch menu | `RETRO_ENVIRONMENT_SHUTDOWN`. With `load_dummy_on_core_shutdown` on, RetroArch returns to its menu. |
 
 Restoring only changes the save used when playing **from the cartridge**
@@ -545,14 +711,14 @@ browsed through *Start directory* use whatever core you pick there.
 
 The firmware version lives in the `VERSION` file at the top of the tree
 (`RETRONSQ_VERSION` in the environment overrides it; the release workflow
-sets it). While the major version is 0, " beta" is added: `0.2.0` is shown as
-**v0.2.0 beta**.
+sets it). While the major version is 0, " beta" is added: `0.3.1` is shown as
+**v0.3.1 beta**.
 
 A Buildroot finalize hook in `retronsq.mk` (`RETRONSQ_INSTALL_VERSION`)
 runs on every build:
 
-- writes `/etc/retronsq-version` ("Retron SQ CFW v0.2.0 beta"), printed at
-  boot and shown by Cartridge Tools;
+- writes `/etc/retronsq-version` ("Retron SQ CFW v0.3.1 beta"), printed at
+  boot and shown by the home screen and Cartridge Tools;
 - fills `@VERSION_LABEL@` into the two SVG templates in
   `buildroot/package/retronsq/splash/` and renders them with `rsvg-convert`
   (from the build container, with its DejaVu fonts) to
@@ -664,10 +830,12 @@ for 720p.
 | Event | Detected by | Runs | Effect |
 | --- | --- | --- | --- |
 | Boot | init | `S50ui` → `StartSession` | session starts, waits for the reader |
-| Cartridge inserted | udev (`add`, or `change` with a media change) | `cart-event` → `CartInserted` | mounted at `/media/cart`; with `CART_AUTOLOAD=1` RetroArch stops and the cartridge plays |
+| Cartridge inserted | udev (`add`, or `change` with a media change) | `cart-event` → `CartInserted` | mounted at `/media/cart`; with `CART_AUTOLOAD=1` RetroArch or the home screen stops and the cartridge plays |
 | Cartridge swapped | udev | `cart-event` → `CartInserted swapped` | remounted; the old cartridge's game stops; then as an insert |
 | Cartridge removed | udev (`remove`, or `change`) | `cart-event` → `CartRemoved` | unmounted; a copy in progress is aborted; RetroArch stops if it ran the cartridge; the menu opens |
-| Reset button | `input-event-daemon` (GPIO key F3) | `reset-btn` → `ResetROM` | RetroArch restarted (cartridge re-read first if `RESET_REDUMP=1`); ignored during a copy |
+| Reset button | `input-event-daemon` (GPIO key F3) | `reset-btn` → `ResetROM` | the game restarts, cartridge or SD card (cartridge re-read first if `RESET_REDUMP=1`); ignored during a copy |
+| Home screen: a game, the cartridge, RetroArch, restart, power off | sqhome | `home-request`, sqhome exits | `RunHomeRequest` does it |
+| *Close Content* in a game from the home screen | RetroArch (patch 0004) | normal quit | back to the home screen |
 | Cartridge Tools → Play cartridge | sqtools core | play flag + SIGTERM to RetroArch | the session plays the cartridge |
 | HDMI plugged/unplugged | udev | `drm-hotplug.sh` | video mode and audio route set; `StartSession` |
 | Quit RetroArch from its menu | – | – | the session starts the right thing again |
@@ -679,16 +847,20 @@ for 720p.
 
 `KEY=value` lines. Windows line endings, spaces and quotes are fine. Read
 with `CfgGet` every time a value is needed, so changes apply the next time a
-game starts. Defaults are defined once, in `CfgDefault` (`common.sh`).
+game starts. Defaults are defined once, in `/usr/share/retronsq/defaults.cfg`
+(`config/defaults.cfg`), read by both `CfgDefault` (`common.sh`) and
+`sq_cfg_get` (libsqcart). The home screen's Settings page writes the file
+with `sq_cfg_set`.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `GBA_CORE` | `gpsp` | core for GBA cartridges and SD games |
 | `GBC_CORE` | `vbam` | core for GBC |
 | `GB_CORE` | `vbam` | core for GB |
-| `NO_CART` | `menu` | `menu`: RetroArch menu without a cartridge. `none`: blank screen like stock |
-| `CART_AUTOLOAD` | `1` | `1`: an inserted cartridge starts at once. `0`: it waits in Cartridge Tools |
-| `CART_WAIT` | `25` | at power-on, wait for a cartridge until this many seconds after switching on (0–120) |
+| `UI` | `home` | start screen: `home` (sqhome) or `retroarch` (RetroArch's menu, as in 0.2) |
+| `NO_CART` | `menu` | `menu`: the start screen without a cartridge. `none`: blank screen like stock |
+| `CART_AUTOLOAD` | `1` | `1`: an inserted cartridge starts at once (once per insert). `0`: it waits on the Cartridge page |
+| `CART_WAIT` | `15` | at power-on, wait for a cartridge until this many seconds after switching on (0–120) |
 | `RESET_REDUMP` | `0` | `1`: reset re-reads the whole cartridge |
 | `VERIFY_CACHE` | `0` | `1`: re-check a cached copy's CRC on every start (stock behaviour, slower) |
 | `VERBOSE` | `1` | detailed RetroArch log (`logs/retroarch.log`, serial console) |
@@ -739,10 +911,11 @@ is the problem; restore an older backup from Cartridge Tools.
 
 | File | Installed as | Role |
 | --- | --- | --- |
-| `src/lib/` | (linked in) | libsqcart: `sqcart.h` (API and paths), `common.c` (paths, errors, files, atomic write), `crc.c`, `copy.c` (pipelined copy), `cart.c` (reader state, scan, cache, library copy), `save.c` (import, backups, restore, Gen 3 check) |
+| `src/lib/` | (linked in) | libsqcart: `sqcart.h` (API and paths), `common.c` (paths, errors, logs, files, atomic write), `crc.c`, `copy.c` (pipelined copy), `cart.c` (reader state, scan, cache, library copy), `save.c` (import, backups, restore, Gen 3 check), `cartwrite.c` (writing a save to the cartridge), `actions.c` (the cartridge actions as the user sees them), `config.c` (settings), `library.c` (games, history, favorites, box art) |
 | `src/cli/sqcart.c` | `/usr/bin/sqcart` | libsqcart for the scripts |
 | `src/load/sqload.c` | `/usr/bin/sqload` | loading screen + first copy |
 | `src/tools/sqtools.c` | `/usr/lib/libretro/sqtools_libretro.so` | Cartridge Tools core |
+| `src/home/` | `/usr/bin/sqhome` | the home screen: `home.c` (pages), `ui.c` (drawing), `input.c` (pads) |
 | `src/tools/bitmap.h`, `libretro.h` | | RGUI font and libretro API header, from RetroArch |
 | `src/tools/cartridge-tools.sqt` | `/usr/share/retronsq/` | what the Cartridge Tools playlist entry loads |
 | `scripts/common.sh` | `/usr/lib/retronsq/` | shared shell functions: paths, settings, cores, launching, event handlers |
@@ -753,6 +926,7 @@ is the problem; restore an older backup from Cartridge Tools.
 | `scripts/S50ui` | `/etc/init.d/S50ui` | boot: audio, splash, session |
 | `udev/90-retronsq-cart.rules` | `/lib/udev/rules.d/` | reader events to `cart-event`, media polling |
 | `config/retroarch-cfw.cfg` | `/usr/share/retronsq/` | RetroArch settings the firmware needs |
+| `config/defaults.cfg` | `/usr/share/retronsq/` | every setting's default |
 | `splash/*.svg` | `/etc/retronsq-*.png` | boot splash and loading screen templates |
 
 Elsewhere:
@@ -773,8 +947,9 @@ See [DEVELOPING.md](DEVELOPING.md).
 
 ## Known limits
 
-- Saves are never written back to a cartridge, by design: the cartridge is
-  read-only, and the SD card's `.srm` is the save.
+- Saves are never written back to a cartridge automatically: the SD
+  card's `.srm` is the save. *Write a save to the cartridge* does it on
+  request, and is untested on real hardware.
 - Copying a cartridge whose checksum never matches (some reproduction
   carts) to the SD card twice gives two copies, `<name> (2)`: without a
   trustworthy checksum it can't be recognised as already copied.

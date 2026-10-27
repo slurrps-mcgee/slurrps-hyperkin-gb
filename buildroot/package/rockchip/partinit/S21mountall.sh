@@ -275,6 +275,12 @@ grow_userdata_part()
 
 # Keep this boot's storage log on the SD card (logs/boot.log), so a problem
 # with growing or checking the card can be read on a PC
+# Seconds since power-on, to time each step in boot.log
+uptime_s()
+{
+	cut -d ' ' -f 1 /proc/uptime
+}
+
 save_boot_log()
 {
 	mountpoint -q /userdata || return
@@ -284,9 +290,9 @@ save_boot_log()
 		cat /etc/retronsq-version 2>/dev/null
 		uname -a
 		echo; echo "--- /proc/partitions"; cat /proc/partitions
-		echo; echo "--- grow and resize"; cat $RESIZE_LOG
-		echo; echo "--- check"; cat $CHECK_LOG
-		echo; echo "--- mount"; cat $MOUNT_LOG
+		echo; echo "--- grow and resize ($T_RESIZE s -> $T_CHECK s since power-on)"; cat $RESIZE_LOG
+		echo; echo "--- check ($T_CHECK s -> $T_MOUNT s)"; cat $CHECK_LOG
+		echo; echo "--- mount ($T_MOUNT s -> $(uptime_s) s)"; cat $MOUNT_LOG
 		echo; echo "--- df"; df -h
 	} > /userdata/logs/boot.log 2>&1
 	sync
@@ -359,11 +365,14 @@ case "$1" in
 		mountall 2>&1 | tee $MOUNT_LOG
 		echo Log saved to $MOUNT_LOG
 	else
+		T_RESIZE=$(uptime_s)
 		grow_userdata_part 2>&1 | tee $RESIZE_LOG
 		resizeall 2>&1 | tee -a $RESIZE_LOG
 		echo Log saved to $RESIZE_LOG
+		T_CHECK=$(uptime_s)
 		checkall 2>&1 | tee $CHECK_LOG
 		echo Log saved to $CHECK_LOG
+		T_MOUNT=$(uptime_s)
 		mountall 2>&1 | tee $MOUNT_LOG
 		echo Log saved to $MOUNT_LOG
 		save_boot_log

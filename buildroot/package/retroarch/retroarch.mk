@@ -18,6 +18,7 @@ RETROARCH_SITE_METHOD = local
 #   0001 udev input: alternative keyboards (stock Hyperkin)
 #   0002 FPS in the verbose log (stock Hyperkin)
 #   0003 save RAM written atomically: tmp + fsync + rename (Retron SQ CFW)
+#   0004 Close Content quits when started from the home screen (Retron SQ CFW)
 
 RETROARCH_DEPENDENCIES = host-pkgconf
 

@@ -5,6 +5,9 @@
 #
 #   cart-event add|change|remove DEV    from udev (90-retronsq-cart.rules)
 #   cart-event reconcile                from sq-session (boot, fallback)
+#   cart-event write-enable|write-disable
+#                                       from Cartridge Tools, around its
+#                                       "Write a save to the cartridge"
 #
 # Whatever the event, it reconciles: it looks at what the reader has *now*
 # and makes the mount match. That covers readers that reconnect on a swap
@@ -19,12 +22,19 @@
 # medium out, new one in) is "swapped": CartInserted with the removal's
 # effects, so RetroArch is stopped only once. Mounting is read-only, and the
 # reader's block device is set read-only first (hdparm -r1): nothing can
-# ever write to a cartridge.
+# write to a cartridge, except between write-enable and write-disable,
+# which Cartridge Tools runs around the one write the user asked for.
+#
+# Before locking a newly attached drive, its read-only flag is recorded in
+# $RUN_DIR/reader-wp: the kernel sets it when the device itself reports
+# write protection, i.e. the reader won't take writes at all.
 #
 . "${SQ_LIB:-${SQ_ROOT:-}/usr/lib/retronsq}/common.sh"
 
 PORT="$R/sys/bus/usb/devices/3-1"
 GEN_FILE="$RUN_DIR/cart-generation"
+WP_FILE="$RUN_DIR/reader-wp"          # "0"/"1": the drive's own write protection
+WP_DISK="$RUN_DIR/reader-wp.disk"     # the drive it was read from
 
 # The reader's disk ("sda") when the reader is on its USB port
 ReaderDisk(){
@@ -54,6 +64,102 @@ MountedDevice(){
 		"$R/proc/mounts" 2> /dev/null
 }
 
+# SetReadOnly 0|1 DISK [DEVICE]: the kernel's read-only flag on the disk
+# and, if the cartridge is mounted from a partition, on that too (on this
+# kernel the flag is per block device)
+SetReadOnly(){
+	hdparm -r$1 "/dev/$2" > /dev/null 2>&1
+	[ -n "$3" ] && [ "$3" != "$2" ] && hdparm -r$1 "/dev/$3" > /dev/null 2>&1
+	return 0
+}
+
+# Mount DEVICE read-only at /media/cart
+MountReadOnly(){
+	mount -t vfat -o ro,noexec,nodev,noatime "/dev/$1" "$READER_DIR"
+}
+
+# LogReaderInfo DISK: what the reader is, for working out what else it can
+# do (writing saves, programming blank cartridges): its USB identity, every
+# USB interface it has (only the mass-storage one is used), and its drive.
+# Once per attached drive, like RecordWriteProtect.
+LogReaderInfo(){
+	local f i line
+	line="cartridge reader:"
+	for f in idVendor idProduct bcdDevice manufacturer product speed bNumInterfaces; do
+		line="$line $f=$(cat "$PORT/$f" 2> /dev/null | tr -d '\n')"
+	done
+	LogSD "$line"
+	for i in "$PORT"/3-1:*; do
+		[ -d "$i" ] || continue
+		line="  interface ${i##*/}:"
+		for f in bInterfaceClass bInterfaceSubClass bInterfaceProtocol bNumEndpoints interface; do
+			line="$line $f=$(cat "$i/$f" 2> /dev/null | tr -d '\n')"
+		done
+		line="$line driver=$(basename "$(readlink "$i/driver" 2> /dev/null)" 2> /dev/null)"
+		for f in "$i"/ep_*; do
+			[ -d "$f" ] && line="$line ${f##*/}:$(cat "$f/type" 2> /dev/null)/$(cat "$f/direction" 2> /dev/null)"
+		done
+		LogSD "$line"
+	done
+	line="  drive $1:"
+	for f in device/vendor device/model device/rev removable size; do
+		line="$line ${f#device/}=$(cat "$R/sys/class/block/$1/$f" 2> /dev/null | tr -d '\n' | tr -s ' ')"
+	done
+	LogSD "$line"
+}
+
+# RecordWriteProtect DISK: note whether the drive reports write protection.
+# Only before this script first locks it (hdparm -r1 sets the same flag):
+# once per attached drive.
+RecordWriteProtect(){
+	[ "$(cat "$WP_DISK" 2> /dev/null)" = "$1" ] && return
+	LogReaderInfo "$1"
+	cat "$R/sys/class/block/$1/ro" > "$WP_FILE" 2> /dev/null || rm -f "$WP_FILE"
+	echo "$1" > "$WP_DISK"
+	LogSD "cartridge: reader write protection: $(cat "$WP_FILE" 2> /dev/null || echo unknown)"
+}
+
+# WriteEnable: open the mounted cartridge for writing (block device and
+# mount). Refused when there is no cartridge or the reader is write
+# protected.
+WriteEnable(){
+	local disk have
+	disk=$(ReaderDisk)
+	have=$(MountedDevice)
+	if [ -z "$disk" ] || [ -z "$have" ]; then
+		LogSD "cartridge: no mounted cartridge to open for writing"
+		return 1
+	fi
+	if [ "$(cat "$WP_FILE" 2> /dev/null)" = 1 ]; then
+		LogSD "cartridge: the reader is write protected, not opening it"
+		return 1
+	fi
+	SetReadOnly 0 "$disk" "$have"
+	if ! mount -o remount,rw,noexec,nodev,noatime "$READER_DIR"; then
+		SetReadOnly 1 "$disk" "$have"
+		LogSD "cartridge: couldn't remount /dev/$have for writing"
+		return 1
+	fi
+	LogSD "cartridge: opened /dev/$have for writing"
+}
+
+# WriteDisable: back to read-only, whatever happened. If the mount can't
+# be switched back, it is replaced by a fresh read-only one (same device,
+# so no insert or remove is reported).
+WriteDisable(){
+	local disk have
+	disk=$(ReaderDisk)
+	have=$(MountedDevice)
+	sync
+	if [ -n "$have" ] && ! mount -o remount,ro "$READER_DIR"; then
+		umount -l "$READER_DIR"
+		[ -n "$disk" ] && SetReadOnly 1 "$disk" "$have"
+		MountReadOnly "$have" || LogSD "cartridge: couldn't mount /dev/$have read-only again"
+	fi
+	[ -n "$disk" ] && SetReadOnly 1 "$disk" "$have"
+	LogSD "cartridge: read-only again"
+}
+
 # Reconcile [force]: make /media/cart match the reader. "force" remounts
 # even if the same device is still there (a media change).
 Reconcile(){
@@ -75,10 +181,16 @@ Reconcile(){
 		fi
 	fi
 
+	# The reader is gone: forget its write protection
+	if [ -z "$disk" ]; then
+		rm -f "$WP_FILE" "$WP_DISK"
+	fi
+
 	if [ -n "$want" ] && [ -z "$have" ]; then
-		hdparm -r1 "/dev/$disk" > /dev/null 2>&1
+		RecordWriteProtect "$disk"
+		SetReadOnly 1 "$disk" "$want"
 		mkdir -p "$READER_DIR"
-		if mount -t vfat -o ro,noexec,nodev,noatime "/dev/$want" "$READER_DIR"; then
+		if MountReadOnly "$want"; then
 			inserted=1
 		else
 			LogSD "cartridge: couldn't mount /dev/$want"
@@ -106,6 +218,10 @@ exec 9> "$RUN_DIR/cart-event.lock"
 flock 9
 
 Log "cart-event $* (media change: ${DISK_MEDIA_CHANGE:-0})"
+case "$1" in
+	write-enable) WriteEnable; exit ;;
+	write-disable) WriteDisable; exit ;;
+esac
 if [ "$1" = change ] && [ "$DISK_MEDIA_CHANGE" = 1 ]; then
 	Reconcile force
 else

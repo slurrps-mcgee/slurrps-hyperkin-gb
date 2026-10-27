@@ -10,6 +10,7 @@ How to build, test and extend the firmware. For how it works, see
 - [Rules of the code](#rules-of-the-code)
 - [Recipes](#recipes)
   - [Add a setting](#add-a-setting)
+  - [Change the home screen](#change-the-home-screen)
   - [Add a sqcart command](#add-a-sqcart-command)
   - [Add a Cartridge Tools action](#add-a-cartridge-tools-action)
   - [React to a new event](#react-to-a-new-event)
@@ -27,8 +28,9 @@ How to build, test and extend the firmware. For how it works, see
 buildroot/package/retronsq/      everything the firmware adds (one package)
   src/lib/                       libsqcart: all cartridge and save logic (C)
   src/cli/  src/load/  src/tools/  sqcart, sqload, Cartridge Tools
+  src/home/                      sqhome, the home screen
   scripts/                       common.sh, sq-session, cart-event, ...
-  udev/  config/  splash/        udev rule, RetroArch settings, screens
+  udev/  config/  splash/        udev rule, defaults + RetroArch settings, screens
   retronsq.mk  Config.in         how Buildroot builds and installs it
 buildroot/package/retroarch/     RetroArch 1.7.4: src/ + a .patch per change
 buildroot/package/rockchip/partinit/S21mountall.sh   storage at boot
@@ -120,7 +122,8 @@ some groups only with:
 | `cartevent` | hot-plug: insert, swap with and without reconnecting, stale mounts, partitions, unreadable media, racing events |
 | `session` | sq-session end to end: boot with/without cartridge, insert/pull while running, auto-load off, Play cartridge, reset, a stuck RetroArch, a v0.2.0 SD card, a cartridge reported late, failed copies, `NO_CART=none` |
 | `grow` | first-boot partition grow on GPT images (512 MiB and 128 GiB cards, already full, blocked) |
-| `load` | the loading screen under Xvfb: copy, save import, screenshots, no display |
+| `load` | the loading screen under Xvfb: copy, save import, screenshots, no display, a cartridge that stops answering |
+| `home` | the home screen, headless (SDL's dummy video driver), driven by scripted buttons: playing, history, favorites, box art, settings, restart/power off, the cartridge page, SIGTERM |
 
 How they work:
 
@@ -152,14 +155,20 @@ few lines in an existing file.
 ## Rules of the code
 
 - **Never write to a cartridge.** Open reader files read-only; the mount and
-  the block device are read-only too. Saves live on the SD card.
+  the block device are read-only too. Saves live on the SD card. The only
+  exception is `src/lib/cartwrite.c`, behind Cartridge Tools' explicit,
+  double-confirmed *Write a save to the cartridge*; keep it that way.
 - **Write files atomically**: `sq_write_atomic()` in C (temporary file,
   fsync, rename); in shell, write `file.tmp` then `mv`. The console is
   switched off by pulling the power.
 - **All cartridge logic is in libsqcart.** Scripts call `sqcart`, programs
   link the library. Don't re-implement a CRC or a copy anywhere else.
 - **Only sq-session starts RetroArch.** Everything else stops it
-  (`KillGame`) and lets the session decide what runs next.
+  (`KillGame`) and lets the session decide what runs next. The home screen
+  too: it writes a request and exits.
+- **Keep the home screen light.** Draw only when something changed, no
+  per-frame work, cache text, load images lazily. The console is a
+  Cortex-A7 with a Mali-400.
 - **Paths through `$SQ_ROOT`**: `sq_path()` in C, `$R`/the variables in
   `common.sh` in scripts. That's what makes the tests possible.
 - **Shell is BusyBox ash.** No arrays, no `[[ ]]`, no `${var//}`; `local`
@@ -179,18 +188,40 @@ few lines in an existing file.
 
 ### Add a setting
 
-1. Pick a name and default; add it to `CfgDefault` in
-   `scripts/common.sh` (the only place defaults live).
+1. Pick a name and default; add it to `config/defaults.cfg` (the only
+   place defaults live; the scripts and libsqcart both read it).
 2. Read it where needed: `CfgGet NAME` for words, `CfgNum NAME MAX` for
    numbers (non-numbers fall back to the default).
 3. Document it in `device/rockchip/userdata/userdata_brk01/retronsq.cfg`
-   (what users see) and the settings table in `DOCUMENTATION.md`.
+   (what users see) and the settings table in `DOCUMENTATION.md`. To make
+   it changeable on the console, add a row to the home screen's Settings
+   (next recipe).
 4. Test it in `tests/scripts/test_config.sh` or `test_session.sh`
    (`SetCfg NAME value`).
 
 Existing SD cards don't get new lines in their `retronsq.cfg` (user files
 are never overwritten), which is why the default must be the right
 behaviour.
+
+### Change the home screen
+
+`src/home/home.c`:
+
+- **A setting row:** add to `enum setting`, `setting_label[]` and
+  `setting_key[]` (the `retronsq.cfg` key), then how it looks
+  (`setting_text`) and how Left/Right/A change it (`change_setting`).
+  Values are saved with `sq_cfg_set`, which only takes plain values.
+- **A page:** add to `enum page` and `page_name[]`, fill `games` in
+  `load_page` for a game list (or draw it yourself in `render`, like the
+  Cartridge and Settings pages).
+- **Starting something new:** add an `ACTION=` to `request()` callers and
+  handle it in `RunHomeRequest` (`common.sh`). Validate anything that comes
+  from SD card files before using it in a path or command.
+- **Look:** colours are the `COL_*` values in `home.h`, sizes the layout
+  `#define`s at the top of `home.c`, all in 1280×720 coordinates.
+- **Test it** in `tests/home/test_home.sh` (`RunHome "down a ..."`, then
+  check the request, `retronsq.cfg` or `home/`), and look at it:
+  `SQTOOLS_SHOTS=dir` saves every `shot:NAME` as a BMP.
 
 ### Add a sqcart command
 
@@ -204,21 +235,26 @@ behaviour.
 
 ### Add a Cartridge Tools action
 
-In `src/tools/sqtools.c`:
+Put the action itself in `src/lib/actions.c` (`sq_do_*`: the steps and the
+lines shown to the user), so the home screen's Cartridge page and the
+RetroArch tools core both get it. Then add it to both front ends: in
+`src/home/home.c`, `enum cart_item`, `cart_label[]`, `cart_help[]`,
+`cart_item_enabled`, `activate` and a `TASK_*`; and in `src/tools/sqtools.c`:
 
 1. Add an `ITEM_*` to `enum item` and its label to `item_label[]`.
 2. Say when it's available in `ItemEnabled()` and what it does in
    `ItemHelp()`.
 3. In `HandleInput()`, `case ITEM_...:` either act at once, or run a
-   task: write `static void* TaskSomething(void* arg)` that does the work
-   with libsqcart, sets `work_title`/`work_total`/`work_done` for the
-   progress bar, ends with `SetMessage()` or `SetError()`, and clears
-   `worker_busy`; then `StartTask(TaskSomething)` (which first checks the
-   cartridge wasn't swapped).
+   task: a `static void* TaskSomething(void* arg)` that sets
+   `work_title`/`work_total`, calls the `sq_do_*` action, shows its result
+   with `SetResult()` and clears `worker_busy`; then
+   `StartTask(TaskSomething)` (which first checks the cartridge wasn't
+   swapped).
 4. Test it in `tests/tools/test_sqtools.c` (`choose(ITEM_...)`,
-   `wait_task()`, `message_is()`).
+   `wait_task()`, `message_is()`) and `tests/home/test_home.sh`.
 
-The screen is 320×240 with 50 columns of text; keep messages short.
+Result lines are at most 50 characters (`SQ_RESULT_COLS`): the tools core's
+screen is 320×240.
 
 ### React to a new event
 

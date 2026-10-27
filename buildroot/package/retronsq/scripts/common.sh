@@ -11,8 +11,9 @@
 #     RetroArch runs that copy with a libretro emulator core.
 #   - With no cartridge, RetroArch starts in its menu, so games stored on
 #     the SD card (/userdata/roms) can be picked.
-#   - The cartridge is only ever read: its block device is set read-only and
-#     it is mounted read-only. Saves live on the SD card only.
+#   - The cartridge is only read: its block device is set read-only and it
+#     is mounted read-only. Saves live on the SD card. (The one exception is
+#     Cartridge Tools' "Write a save to the cartridge", see cart-event.)
 #
 # Cartridge work (copying, CRC, saves, backups) is done by the sqcart command
 # (libsqcart, the same code as sqload and Cartridge Tools); this file is the
@@ -37,6 +38,7 @@ RETROARCH_BIN="${RETROARCH_BIN:-/usr/bin/retroarch}"
 RETROARCH_CON="$R/userdata/retroarch/retroarch.cfg"
 # Settings the firmware needs, loaded on top of RETROARCH_CON
 RETROARCH_CFW_CON="${SQ_SHARE:-$R/usr/share/retronsq}/retroarch-cfw.cfg"
+DEFAULTS_CFG="${SQ_SHARE:-$R/usr/share/retronsq}/defaults.cfg"  # every setting's default
 BUILTIN_CORE_DIR="$R/usr/lib/libretro"         # cores built into the firmware
 USER_CORE_DIR="$R/userdata/retroarch/cores"    # cores on the SD card (+ copies of the above)
 DEFAULTS_DIR="$R/usr/share/retronsq/userdata"  # factory copy of the SD card's files
@@ -46,6 +48,7 @@ CART_OVERRIDES="$R/userdata/cart-overrides.txt" # per-cartridge core choice
 MGBA_LIST="$R/userdata/gb.txt"                 # Hyperkin's list of games that need mGBA
 SQCART="${SQCART:-/usr/bin/sqcart}"
 SQLOAD="${SQLOAD:-/usr/bin/sqload}"
+SQHOME="${SQHOME:-/usr/bin/sqhome}"
 
 # --- Runtime state (tmpfs, gone after a reboot) ------------------------------
 
@@ -55,7 +58,11 @@ SESSION_LOCK="$RUN_DIR/session.lock"          # held by sq-session for its whole
 MODE_FILE="$RUN_DIR/mode"                     # "cart" or "menu": what RetroArch runs now
 REDUMP_FLAG="$RUN_DIR/redump"                 # reset: copy the cartridge again
 CART_FAILED="$RUN_DIR/cart-failed"            # cartridge failed to load: show the menu
-PLAY_FLAG="$RUN_DIR/play-cart"                # Cartridge Tools: play the cartridge now
+PLAY_FLAG="$RUN_DIR/play-cart"                # Cartridge Tools / home: play the cartridge now
+CART_PLAYED="$RUN_DIR/cart-played"            # this insert already auto-started
+HOME_REQUEST="$RUN_DIR/home-request"          # what sqhome asked for (see RunHomeRequest)
+REPLAY_FLAG="$RUN_DIR/replay"                 # reset button: start the same game again
+WRITE_CHECK="$RUN_DIR/write-check.txt"        # verdict on a save written to the cartridge
 RA_LOG="$RUN_DIR/retroarch.log"               # RetroArch's log for the current run
 HOME="$R/userdata"                            # RetroArch expands "~" in its config to this
 
@@ -106,17 +113,10 @@ CfgGet(){
 	echo "${val:-$(CfgDefault "$1")}"
 }
 
-# The one place defaults are defined (retronsq.cfg documents them)
+# A setting's default, from defaults.cfg: the one place defaults are
+# defined (libsqcart reads the same file; retronsq.cfg documents them)
 CfgDefault(){
-	case "$1" in
-		GBA_CORE)       echo gpsp ;;
-		GBC_CORE|GB_CORE) echo vbam ;;
-		NO_CART)        echo menu ;;
-		CART_AUTOLOAD)  echo 1 ;;
-		CART_WAIT)      echo 25 ;;
-		RESET_REDUMP|VERIFY_CACHE) echo 0 ;;
-		VERBOSE)        echo 1 ;;
-	esac
+	sed -n "s/^$1=//p" "$DEFAULTS_CFG" 2> /dev/null | tail -n 1
 }
 
 # CfgNum KEY MAX: a numeric setting, clamped to MAX; the default if the
@@ -184,7 +184,7 @@ DisplayConnected(){
 #              second in case its udev event came before anything could
 #              handle it
 #   none/empty no cartridge *yet*: only final once CART_WAIT seconds have
-#              passed since power-on (default 25)
+#              passed since power-on (default 15)
 # Each change of state is logged with its time since power-on, so
 # launcher.log shows how long the reader takes, to tune CART_WAIT.
 WaitForReader(){
@@ -222,7 +222,8 @@ AnyAlive(){
 	return 1
 }
 
-# Stop RetroArch if it is running and wait for it to exit. One SIGTERM is
+# Stop RetroArch (or the home screen) if it is running and wait for it to
+# exit. One SIGTERM is
 # a normal quit in RetroArch 1.7.4: its video driver sees the signal, the
 # run loop ends, and the game's save is written. Exactly one: a second
 # SIGTERM makes RetroArch exit(1) on the spot, without saving. SIGKILL
@@ -234,7 +235,7 @@ AnyAlive(){
 # stdin that never ends freezes RetroArch. RunRetroArch gives it /dev/null.)
 KillGame(){
 	local i=0 pids
-	pids=$(pidof retroarch)
+	pids=$(pidof retroarch sqhome)
 	if [ -n "$pids" ]; then
 		kill $pids 2> /dev/null
 		while AnyAlive $pids && [ $i -lt 60 ]; do
@@ -340,6 +341,17 @@ PrepareCart(){
 		rm -f "$REDUMP_FLAG" "$ROM_PATH$name" "$ROM_PATH${name%.*}.crc"
 	fi
 
+	# A save written to this cartridge earlier (Cartridge Tools): now that
+	# it was put back in, is it really on it? The home screen shows the
+	# answer next time it opens.
+	if "$SQCART" write-check > "$WRITE_CHECK" 2> /dev/null; then
+		while read -r line; do
+			LogSD "  write check: $line"
+		done < "$WRITE_CHECK"
+	else
+		rm -f "$WRITE_CHECK"
+	fi
+
 	[ "$(CfgGet VERIFY_CACHE)" = 1 ] && verify=--verify
 	if "$SQCART" cache-valid $verify; then
 		Log "$name unchanged, skipping cartridge copy"
@@ -370,9 +382,12 @@ PrepareCart(){
 # Its stdin is /dev/null (see KillGame). The log goes to $RA_LOG; VERBOSE=1
 # makes it detailed.
 RunRetroArch(){
-	local verbose=""
+	local verbose="" close=""
 	[ "$(CfgGet VERBOSE)" = 1 ] && verbose=-v
-	HOME=$HOME "$RETROARCH_BIN" $verbose -c "$RETROARCH_CON" \
+	# With the home screen, Close Content in a game goes back to it (a
+	# normal quit, see RetroArch patch 0004) instead of RetroArch's menu
+	[ "$1" != --menu ] && [ "$(CfgGet UI)" != retroarch ] && close=1
+	RETRONSQ_CLOSE_QUITS=$close HOME=$HOME "$RETROARCH_BIN" $verbose -c "$RETROARCH_CON" \
 		--appendconfig="$RETROARCH_CFW_CON" "$@" \
 		< /dev/null > "$RA_LOG" 2>&1
 }
@@ -412,10 +427,98 @@ LaunchCart(){
 	LogSD "starting $name (title '$(CartInfo TITLE)', code '$code') with ${core##*/}"
 	LogSaveState before "$name" "$code"
 	echo cart > "$MODE_FILE"
+	touch "$CART_PLAYED"
+	# Recently played on the home screen: the cartridge's copy, playable
+	# without it
+	"$SQCART" history-add "/userdata/rom/$name" "$(CartLabel)" > /dev/null 2>&1
 	RunRetroArch -L "$core" "$ROM_PATH$name"
 	LogSD "RetroArch exited ($name)"
 	LogSaveState after "$name" "$code"
 	SaveRetroArchLog
+}
+
+# The inserted cartridge's name for lists: its header title, else its file
+# name with spaces ("Pokemon_Emerald" -> "Pokemon Emerald")
+CartLabel(){
+	local title
+	title=$(CartInfo TITLE)
+	[ -n "$title" ] || title=$(CartInfo BASE | tr '_' ' ')
+	echo "$title"
+}
+
+# The home screen (UI=home): runs until the user picks something, then
+# that is started (RunHomeRequest). sq-session comes back here when it ends.
+LaunchHome(){
+	echo home > "$MODE_FILE"
+	LogSD "home screen"
+	rm -f "$HOME_REQUEST"
+	"$SQHOME" > "${SQ_CONSOLE:-/dev/console}" 2>&1
+	RunHomeRequest
+}
+
+# HomeRequest KEY: a value from sqhome's request file
+HomeRequest(){
+	sed -n "s/^$1=//p" "$HOME_REQUEST" 2> /dev/null | head -n 1
+}
+
+# Do what the home screen asked for:
+#   game       play ROM= (a file under /userdata) with its system's core
+#   cart       play the cartridge (sq-session's next pass)
+#   retroarch  RetroArch's own menu (its settings)
+#   reboot, poweroff
+# Nothing (it was stopped, or crashed): sq-session decides what's next.
+RunHomeRequest(){
+	local action rom
+	action=$(HomeRequest ACTION)
+	rom=$(HomeRequest ROM)
+	rm -f "$HOME_REQUEST"
+	# For sq-session's back-off: the home screen did its job
+	[ -n "$action" ] && HOME_ACTED=1
+	case "$action" in
+		game) PlayFromHome "$rom" ;;
+		cart) touch "$PLAY_FLAG" ;;
+		retroarch)
+			echo menu > "$MODE_FILE"
+			RunRetroArch --menu
+			;;
+		reboot|poweroff)
+			LogSD "$action, from the home screen"
+			sync
+			$action
+			;;
+	esac
+}
+
+# PlayFromHome ROM: play the game the home screen asked for. The path
+# comes from files on the SD card (history, favorites), so only a ROM file
+# under /userdata is accepted. The core is picked like for the Collections:
+# a cartridge copy (rom/) gets its cartridge's core, a library game its
+# system's.
+PlayFromHome(){
+	local rom="$1" core
+	case "$rom" in
+		*..*|*"$(printf '\t')"*) rom="" ;;
+		/userdata/*.gb|/userdata/*.gbc|/userdata/*.gba|/userdata/*.zip) ;;
+		/userdata/*.GB|/userdata/*.GBC|/userdata/*.GBA|/userdata/*.ZIP) ;;
+		*) rom="" ;;
+	esac
+	if [ -z "$rom" ] || [ ! -f "$R$rom" ]; then
+		LogSD "home screen: not a game file: $1"
+		return
+	fi
+	case "$rom" in
+		/userdata/rom/*) core=$(CoreForRom "${rom##*/}") ;;
+		*) core=$(SystemCore "$(RomSystem "$rom")") ;;
+	esac
+	echo game > "$MODE_FILE"
+	LogSD "starting $rom from the home screen with ${core##*/}"
+	while :; do
+		rm -f "$REPLAY_FLAG"
+		RunRetroArch -L "$core" "$R$rom"
+		# The reset button asks for the same game again
+		[ -f "$REPLAY_FLAG" ] || break
+	done
+	LogSD "RetroArch exited ($rom)"
 }
 
 # Open the RetroArch menu (no game loaded), after refreshing the game lists
@@ -459,6 +562,21 @@ SyncUserdata(){
 		echo "$stamp" > "$USER_CORE_DIR/.builtin-stamp"
 	fi
 	sync
+}
+
+# --- The screen ------------------------------------------------------------------
+
+# BlankFramebuffer: clear the console framebuffer (fb0) to black. The boot
+# splash is drawn there (S50ui, fbv), and the display falls back to it
+# whenever no program holds the screen: between the loading screen and the
+# game, or a game and the home screen. Cleared once the first program is up,
+# the splash only shows at power-on.
+BlankFramebuffer(){
+	local size bpp
+	size=$(cat "$R/sys/class/graphics/fb0/virtual_size" 2> /dev/null) || return 0
+	bpp=$(cat "$R/sys/class/graphics/fb0/bits_per_pixel" 2> /dev/null) || return 0
+	dd if=/dev/zero of="$R/dev/fb0" bs=$((${size%,*} * bpp / 8)) count=${size#*,} \
+		conv=notrunc 2> /dev/null
 }
 
 # --- Audio -------------------------------------------------------------------
@@ -519,7 +637,7 @@ CartInserted(){
 		rm -f "$PLAY_FLAG"
 		[ "$(cat "$MODE_FILE" 2>/dev/null)" = cart ] && stop=1
 	fi
-	rm -f "$CART_FAILED"
+	rm -f "$CART_FAILED" "$CART_PLAYED"
 	LogSD "cartridge inserted: $(CheckROM)"
 	[ "$(CfgGet CART_AUTOLOAD)" = 1 ] && stop=1
 	[ $stop = 1 ] && KillGame
@@ -532,7 +650,7 @@ CartInserted(){
 CartRemoved(){
 	LogSD "cartridge removed"
 	killall sqload 2> /dev/null
-	rm -f "$CART_FAILED" "$PLAY_FLAG"
+	rm -f "$CART_FAILED" "$PLAY_FLAG" "$CART_PLAYED"
 	[ "$(cat "$MODE_FILE" 2>/dev/null)" = cart ] && KillGame
 }
 
@@ -543,9 +661,15 @@ ResetROM(){
 		Log "reset ignored while the cartridge is being copied"
 		return
 	fi
-	if [ "$(CfgGet RESET_REDUMP)" = 1 ] && [ "$(cat "$MODE_FILE" 2>/dev/null)" = cart ]; then
-		touch "$REDUMP_FLAG"
-	fi
+	case "$(cat "$MODE_FILE" 2>/dev/null)" in
+		cart)
+			[ "$(CfgGet RESET_REDUMP)" = 1 ] && touch "$REDUMP_FLAG"
+			touch "$PLAY_FLAG"	# the same cartridge again
+			;;
+		game)
+			touch "$REPLAY_FLAG"	# the same SD card game again
+			;;
+	esac
 	rm -f "$CART_FAILED"
 	KillGame
 }

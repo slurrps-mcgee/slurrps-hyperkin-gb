@@ -17,6 +17,7 @@ case "$1" in
 	# Boot splash (with the firmware version) stays up until RetroArch or
 	# the loading screen takes over; -e scales it up on 1080p screens
 	/usr/bin/fbv -c -i -e -s 1 /etc/retronsq-splash.png
+	LogSD "boot: splash up"
 	# Runs in the background, so the rest of the boot doesn't wait for it
 	StartSession
 	;;

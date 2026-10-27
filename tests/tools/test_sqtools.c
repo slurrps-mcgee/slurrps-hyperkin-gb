@@ -10,6 +10,9 @@
  */
 #define QUIT_RETROARCH()	(quit_requested = 1)
 #define SCAN_CMD		"true"
+/* cart-event write-enable/-disable: nothing to do in the sandbox (its
+ * files are writable); fails while $SQ_TEST_RW_FAIL is set */
+#define CART_RW_CMD		"test -z \"$SQ_TEST_RW_FAIL\" || false"
 static int quit_requested, shutdown_requested;
 
 #include "sandbox.h"
@@ -68,6 +71,13 @@ static void choose(int item)
 	press(RETRO_DEVICE_ID_JOYPAD_A);
 }
 
+/* On a confirm screen: move to Yes and press it (No is the default) */
+static void yes(void)
+{
+	press(RETRO_DEVICE_ID_JOYPAD_RIGHT);
+	press(RETRO_DEVICE_ID_JOYPAD_A);
+}
+
 /* Back to the main screen from a message */
 static void dismiss(void)
 {
@@ -120,7 +130,9 @@ static int same_file(const char* a_rel, const char* b_rel)
 int main(void)
 {
 	sandbox_init("/tmp/sqtools-test");
-	put_text("/etc/retronsq-version", "Retron SQ CFW v0.2.0 beta\n");
+	/* SQ_TEST_VERSION: the label for documentation screenshots */
+	put_text("/etc/retronsq-version", "Retron SQ CFW %s\n",
+		getenv("SQ_TEST_VERSION") ? getenv("SQ_TEST_VERSION") : "v0.2.2 beta");
 
 	retro_set_environment(env);
 	retro_set_video_refresh(video);
@@ -132,7 +144,7 @@ int main(void)
 	frames(2);
 
 	/* Header shows the firmware version */
-	CHECK(!strcmp(fw_version, "v0.2.0 beta"));
+	CHECK(!strcmp(fw_version, getenv("SQ_TEST_VERSION") ? getenv("SQ_TEST_VERSION") : "v0.2.2 beta"));
 
 	/* No cartridge: only Exit works */
 	shot("no-cartridge");
@@ -186,9 +198,12 @@ int main(void)
 	shot("restore-list");
 	press(RETRO_DEVICE_ID_JOYPAD_DOWN);
 	press(RETRO_DEVICE_ID_JOYPAD_A);
-	CHECK(screen == SCREEN_CONFIRM);
+	CHECK(screen == SCREEN_CONFIRM && confirm_button == 0);
 	shot("restore-confirm");
+	press(RETRO_DEVICE_ID_JOYPAD_A);		/* "No" is selected: cancels */
+	CHECK(screen == SCREEN_RESTORE);
 	press(RETRO_DEVICE_ID_JOYPAD_A);
+	yes();
 	wait_task();
 	CHECK(message_is(0, "Save restored."));
 	CHECK(same_file("/userdata/saves/Pokemon_LeafGreen/001-cartridge.sav", "/userdata/rom/Pokemon_LeafGreen.srm"));
@@ -232,6 +247,111 @@ int main(void)
 	CHECK(!exists("/userdata/roms/gba/Pokemon_Emerald.gba.part"));
 	dismiss();
 	CHECK(!cart.present);
+
+	/* Write a save to the cartridge (experimental). Pokemon LeafGreen
+	 * (code BPGE), 128 KB save. */
+	insert_cart("Pokemon_LeafGreen.gba", 2 * 1024 * 1024, 128 * 1024, 1, 1, 6);
+	frames(31);
+	CHECK(ItemEnabled(ITEM_WRITE_SAVE));
+	{
+		unsigned char* good = calloc(1, 131072);
+		unsigned char* before;
+		char sav[SQ_PATH_LEN];
+		long size;
+
+		make_slot(good, 0, 7, 3);
+		make_slot(good, 1, 8, 4);
+		put("/userdata/rom/Pokemon_LeafGreen.srm", good, 131072);
+		path(sav, "/media/cart/Pokemon_LeafGreen.sav");
+		before = sq_read_all(sav, SQ_MAX_SAVE, &size);
+
+		/* The list starts with the live save; asks twice */
+		main_sel = 0;
+		choose(ITEM_WRITE_SAVE);
+		CHECK(screen == SCREEN_RESTORE && writing);
+		CHECK(!strcmp(backups[0].label, "The save you play with now (128 KB)"));
+		shot("write-list");
+		press(RETRO_DEVICE_ID_JOYPAD_A);
+		CHECK(screen == SCREEN_CONFIRM && confirm_step == 0 && confirm_button == 0);
+		yes();
+		CHECK(screen == SCREEN_CONFIRM && confirm_step == 1 && confirm_button == 0);
+		shot("write-confirm");
+		press(RETRO_DEVICE_ID_JOYPAD_B);
+		CHECK(screen == SCREEN_RESTORE);
+
+		/* A write-protected reader: refused, nothing changed */
+		put_text("/run/retronsq/reader-wp", "1\n");
+		press(RETRO_DEVICE_ID_JOYPAD_A);
+		yes();
+		yes();
+		wait_task();
+		CHECK(message_is(0, "This cartridge slot can't write:"));
+		CHECK(sq_same_content(sav, before, size));
+		dismiss();
+		put_text("/run/retronsq/reader-wp", "0\n");
+
+		/* The cartridge can't be opened for writing: nothing changed */
+		setenv("SQ_TEST_RW_FAIL", "1", 1);
+		main_sel = 0;
+		choose(ITEM_WRITE_SAVE);
+		press(RETRO_DEVICE_ID_JOYPAD_A);
+		yes();
+		yes();
+		wait_task();
+		CHECK(message_is(0, "The cartridge couldn't be opened for writing."));
+		CHECK(sq_same_content(sav, before, size));
+		dismiss();
+		unsetenv("SQ_TEST_RW_FAIL");
+
+		/* Written: the cartridge holds the live save, its old save is
+		 * backed up, and the log says so */
+		main_sel = 0;
+		choose(ITEM_WRITE_SAVE);
+		press(RETRO_DEVICE_ID_JOYPAD_A);
+		yes();
+		yes();
+		wait_task();
+		shot("written");
+		CHECK(message_is(0, "Written to the cartridge."));
+		CHECK(exists("/userdata/home/cart-write-check"));	/* checked at re-insert */
+		CHECK(sq_same_content(sav, good, 131072));
+		{
+			/* (an identical backup from earlier counts: no duplicates) */
+			struct sq_backup list[8];
+			int n = sq_backup_list("Pokemon_LeafGreen", list, 8), i, found = 0;
+			for (i = 0; i < n; i++)
+				found |= !strcmp(list[i].kind, "cartridge") &&
+					sq_same_content(list[i].path, before, size);
+			CHECK(found);
+		}
+		CHECK(size_of("/userdata/logs/launcher.log") > 0);
+		dismiss();
+
+		/* A damaged Pokemon save or one of another size: refused */
+		good[14 * 0x1000 + 5] ^= 0xFF;
+		good[5] ^= 0xFF;
+		put("/userdata/rom/Pokemon_LeafGreen.srm", good, 131072);
+		main_sel = 0;
+		choose(ITEM_WRITE_SAVE);
+		press(RETRO_DEVICE_ID_JOYPAD_A);
+		yes();
+		yes();
+		wait_task();
+		CHECK(message_is(0, "That Pokemon save is damaged"));
+		dismiss();
+		put("/userdata/rom/Pokemon_LeafGreen.srm", good, 65536);
+		main_sel = 0;
+		choose(ITEM_WRITE_SAVE);
+		press(RETRO_DEVICE_ID_JOYPAD_A);
+		yes();
+		yes();
+		wait_task();
+		CHECK(message_is(0, "That save doesn't fit this cartridge."));
+		dismiss();
+		free(before);
+		free(good);
+	}
+	remove_cart();
 
 	/* Play cartridge: asks sq-session for it and leaves RetroArch */
 	insert_cart("Pokemon_LeafGreen.gba", 2 * 1024 * 1024, 128 * 1024, 1, 1, 5);

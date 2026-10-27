@@ -8,10 +8,12 @@
 #   src/load/     sqload: loading screen for a cartridge's first copy
 #   src/cli/      sqcart: libsqcart for the shell scripts
 #   src/tools/    Cartridge Tools, a libretro core run by RetroArch
+#   src/home/     sqhome: the home screen
 #   scripts/      sq-session (runs games), cart-event (hot-plug), common.sh,
 #                 sq-scan-roms, reset-btn, S50ui (boot)
 #   udev/         sends cartridge reader events to cart-event
-#   config/       RetroArch settings the firmware needs (retroarch-cfw.cfg)
+#   config/       setting defaults (defaults.cfg), RetroArch settings the
+#                 firmware needs (retroarch-cfw.cfg)
 #   splash/       boot splash and loading screen, rendered at build time
 #
 # See docs/DOCUMENTATION.md and docs/DEVELOPING.md at the top of the tree.
@@ -33,10 +35,13 @@ RETRONSQ_SCRIPTS = common.sh sq-session sq-scan-roms cart-event reset-btn
 define RETRONSQ_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/src/sqload $(TARGET_DIR)/usr/bin/sqload
 	$(INSTALL) -D -m 0755 $(@D)/src/sqcart $(TARGET_DIR)/usr/bin/sqcart
+	$(INSTALL) -D -m 0755 $(@D)/src/sqhome $(TARGET_DIR)/usr/bin/sqhome
 	$(INSTALL) -D -m 0644 $(@D)/src/sqtools_libretro.so \
 		$(TARGET_DIR)/usr/lib/libretro/sqtools_libretro.so
 	$(INSTALL) -D -m 0644 $(@D)/config/retroarch-cfw.cfg \
 		$(TARGET_DIR)/usr/share/retronsq/retroarch-cfw.cfg
+	$(INSTALL) -D -m 0644 $(@D)/config/defaults.cfg \
+		$(TARGET_DIR)/usr/share/retronsq/defaults.cfg
 	$(INSTALL) -D -m 0644 $(@D)/src/tools/cartridge-tools.sqt \
 		$(TARGET_DIR)/usr/share/retronsq/cartridge-tools.sqt
 	for f in $(RETRONSQ_SCRIPTS); do \
@@ -50,7 +55,7 @@ endef
 
 # Firmware version: RETRONSQ_VERSION from the environment (the release
 # workflow sets it), else the VERSION file at the top of the tree. While the
-# major version is 0 the screens say "v0.2.0 beta".
+# major version is 0 the screens say "v0.3.1 beta".
 RETRONSQ_VERSION ?= $(shell cat $(TOPDIR)/../VERSION 2>/dev/null)
 RETRONSQ_VERSION_LABEL = v$(RETRONSQ_VERSION)$(if $(filter 0.%,$(RETRONSQ_VERSION)), beta)
 

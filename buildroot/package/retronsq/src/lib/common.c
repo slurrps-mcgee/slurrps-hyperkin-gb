@@ -49,6 +49,75 @@ void sq_log(const char* fmt, ...)
 	fprintf(stderr, "\n");
 }
 
+void sq_log_sd(const char* fmt, ...)
+{
+	char path[SQ_PATH_LEN], up[32] = "?";
+	va_list ap;
+	FILE* fp;
+
+	va_start(ap, fmt);
+	fprintf(stderr, "sq: ");
+	vfprintf(stderr, fmt, ap);
+	fprintf(stderr, "\n");
+	va_end(ap);
+
+	fp = fopen("/proc/uptime", "r");
+	if (fp) {
+		if (fscanf(fp, "%31s", up) != 1)
+			strcpy(up, "?");
+		fclose(fp);
+	}
+	sq_mkdirs(sq_path(path, sizeof(path), "/userdata/logs"));
+	fp = fopen(sq_path(path, sizeof(path), "/userdata/logs/launcher.log"), "a");
+	if (!fp)
+		return;
+	fprintf(fp, "[%s] ", up);
+	va_start(ap, fmt);
+	vfprintf(fp, fmt, ap);
+	va_end(ap);
+	fprintf(fp, "\n");
+	fflush(fp);
+	fsync(fileno(fp));	/* the power gets pulled: keep the line */
+	fclose(fp);
+}
+
+void sq_meter_start(struct sq_meter* m, long total)
+{
+	m->total = total;
+	m->first_ms = 0;
+	m->first_bytes = 0;
+}
+
+void sq_meter_text(struct sq_meter* m, long done, unsigned long now_ms, int finished,
+	char* size, size_t size_len, char* rate, size_t rate_len)
+{
+	if (done > m->total)
+		done = m->total;
+	snprintf(size, size_len, "%.1f of %.1f MB", done / 1048576.0, m->total / 1048576.0);
+	if (done > 0 && m->first_ms == 0) {
+		m->first_ms = now_ms ? now_ms : 1;
+		m->first_bytes = done;
+	}
+	if (finished) {
+		snprintf(rate, rate_len, "Done");
+	} else if (m->first_ms && now_ms - m->first_ms > 1500 && done > m->first_bytes) {
+		double bps = (done - m->first_bytes) * 1000.0 / (now_ms - m->first_ms);
+		int left = (int)((m->total - done) / bps + 0.5);
+		char speed[24], when[32];
+		if (bps >= 1048576.0)
+			snprintf(speed, sizeof(speed), "%.1f MB/s", bps / 1048576.0);
+		else
+			snprintf(speed, sizeof(speed), "%ld KB/s", (long)(bps / 1024.0 + 0.5));
+		if (left >= 60)
+			snprintf(when, sizeof(when), "about %d min %02d s left", left / 60, left % 60);
+		else
+			snprintf(when, sizeof(when), "about %d s left", left < 1 ? 1 : left);
+		snprintf(rate, rate_len, "%s, %s", speed, when);
+	} else {
+		snprintf(rate, rate_len, "Measuring speed...");
+	}
+}
+
 int sq_ends_with(const char* name, const char* ext)
 {
 	size_t n = strlen(name), e = strlen(ext);

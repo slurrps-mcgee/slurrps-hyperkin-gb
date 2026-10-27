@@ -15,9 +15,15 @@
  *   Restore a save...        pick a backup (or the save on the cartridge) to
  *                            become rom/<game>.srm, the save used when the
  *                            cartridge is played
+ *   Write a save to the cartridge...
+ *                            experimental: pick the live save or a backup
+ *                            and write it onto the cartridge itself
  *
  * All cartridge work is done by libsqcart (lib/sqcart.h); this file is only
- * the screens. The cartridge is only ever read (it is mounted read-only).
+ * the screens. The cartridge is read-only (mounted read-only, its device
+ * locked) except during "Write a save to the cartridge": that backs up the
+ * cartridge's save, unlocks it (cart-event write-enable), writes the one
+ * save file in place and checks it, and locks it again (write-disable).
  * Long copies run in a worker thread so the progress bar keeps moving, and
  * every action re-checks that the cartridge wasn't swapped meanwhile.
  */
@@ -28,6 +34,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "libretro.h"
 #include "bitmap.h"		/* RetroArch's 5x10 RGUI font (GPLv3) */
@@ -38,7 +45,11 @@
 #ifndef SCAN_CMD
 #define SCAN_CMD	"/usr/lib/retronsq/sq-scan-roms"	/* refreshes Collections */
 #endif
-#define VERSION_FILE	"/etc/retronsq-version"		/* "Retron SQ CFW v0.2.0 beta" */
+/* Opens / closes the cartridge for writing (see cart-event). Tests replace it. */
+#ifndef CART_RW_CMD
+#define CART_RW_CMD	"/usr/lib/retronsq/cart-event"
+#endif
+#define VERSION_FILE	"/etc/retronsq-version"		/* "Retron SQ CFW v0.3.1 beta" */
 
 /* Leave RetroArch so sq-session takes over. SIGTERM makes RetroArch exit
  * cleanly (saving), like sq-session's own stop. Tests replace it. */
@@ -80,20 +91,25 @@ static struct sq_cart cart;			/* the inserted cartridge */
 enum screen { SCREEN_MAIN, SCREEN_RESTORE, SCREEN_CONFIRM, SCREEN_BUSY, SCREEN_MESSAGE };
 static enum screen screen = SCREEN_MAIN;
 
-enum item { ITEM_PLAY, ITEM_DUMP_ROM, ITEM_DUMP_SAVE, ITEM_RESTORE, ITEM_EXIT, ITEM_COUNT };
+enum item { ITEM_PLAY, ITEM_DUMP_ROM, ITEM_DUMP_SAVE, ITEM_RESTORE, ITEM_WRITE_SAVE,
+	ITEM_EXIT, ITEM_COUNT };
 static const char* item_label[ITEM_COUNT] = {
 	"Play cartridge",
 	"Copy cartridge to SD card",
 	"Back up cartridge save",
 	"Restore a save...",
+	"Write a save to the cartridge...",
 	"Back to RetroArch menu",
 };
 static int main_sel = 0;
 
-/* Saves offered by "Restore a save...": the cartridge's own, then backups */
-struct choice { char label[64]; char path[SQ_PATH_LEN]; };
-static struct choice backups[MAX_BACKUPS + 1];
+/* Saves offered by "Restore a save..." or "Write a save to the
+ * cartridge..." (sq_save_choices) */
+static struct sq_save_choice backups[MAX_BACKUPS + 1];
 static int backup_count = 0, restore_sel = 0;
+static int writing = 0;		/* the list is for writing to the cartridge */
+static int confirm_step = 0;	/* writing asks twice */
+static int confirm_button = 0;	/* 0 = No (the default), 1 = Yes */
 
 /* Result shown on SCREEN_MESSAGE: up to 4 lines, the first one coloured */
 static char msg[4][COLS + 1];
@@ -104,9 +120,10 @@ static pthread_t worker;
 static volatile int worker_busy = 0;
 static volatile long work_done = 0, work_total = 0;
 static char work_title[COLS + 1];
+static struct sq_meter meter;		/* "MB of MB", speed and time left */
 
 static int frame_count = 0;
-static char fw_version[COLS + 1];	/* "v0.2.0 beta", shown in the header */
+static char fw_version[COLS + 1];	/* "v0.3.1 beta", shown in the header */
 
 /* --- small helpers ------------------------------------------------------ */
 
@@ -120,15 +137,10 @@ static void SetMessage(uint16_t color, const char* l1, const char* l2, const cha
 	msg_color = color;
 }
 
-/* Show a library error, split over two lines if it is long */
-static void SetError(const char* what, const struct sq_error* e)
+/* Show what a shared action (sqcart.h, sq_do_*) did */
+static void SetResult(const struct sq_result* r)
 {
-	char l2[COLS + 1] = "", l3[COLS + 1] = "";
-	size_t n = strlen(e->msg);
-	snprintf(l2, sizeof(l2), "%s", e->msg);
-	if (n > COLS)
-		snprintf(l3, sizeof(l3), "%s", e->msg + COLS);
-	SetMessage(C_BAD, what, l2, l3[0] ? l3 : NULL, NULL);
+	SetMessage(r->ok ? C_OK : C_BAD, r->line[0], r->line[1], r->line[2], r->line[3]);
 }
 
 /* "128 KB", "16.0 MB" */
@@ -140,119 +152,79 @@ static void SizeText(long size, char* out, size_t len)
 		snprintf(out, len, "%ld KB", (size + 1023) / 1024);
 }
 
+/* Milliseconds on a monotonic clock, for the copy's speed */
+static unsigned long NowMs(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1000UL + t.tv_nsec / 1000000;
+}
+
 static void Progress(long done, void* ctx)
 {
 	(void)ctx;
 	work_done = done;
 }
 
-/* Fill backups[] for the restore list: the save on the cartridge first,
- * then the backups in saves/<game>/, newest first */
+/* Fill backups[] for the restore or write list */
 static void ListBackups(void)
 {
-	static struct sq_backup list[MAX_BACKUPS];
-	char size_text[16], kind[32];
-	int i, n;
-	char* p;
-
-	backup_count = 0;
+	backup_count = sq_save_choices(&cart, writing, backups, MAX_BACKUPS + 1);
 	restore_sel = 0;
-	if (cart.save_size > 0) {
-		SizeText(cart.save_size, size_text, sizeof(size_text));
-		snprintf(backups[0].label, sizeof(backups[0].label),
-			"Save on the cartridge now (%s)", size_text);
-		sq_cart_reader_path(&cart, ".sav", backups[0].path, sizeof(backups[0].path));
-		backup_count = 1;
-	}
-	n = sq_backup_list(cart.base, list, MAX_BACKUPS);
-	for (i = 0; i < n; i++, backup_count++) {
-		/* "before-restore" -> "before restore" */
-		snprintf(kind, sizeof(kind), "%s", list[i].kind);
-		for (p = kind; *p; p++)
-			if (*p == '-')
-				*p = ' ';
-		SizeText(list[i].size, size_text, sizeof(size_text));
-		snprintf(backups[backup_count].label, sizeof(backups[0].label),
-			"#%d %s (%s)", list[i].number, kind, size_text);
-		snprintf(backups[backup_count].path, sizeof(backups[0].path), "%s", list[i].path);
-	}
 }
 
 /* --- the actions (run in the worker thread) ----------------------------- */
 
-/* Copy cartridge to SD card: into roms/<system>/ with its save, then
- * refresh the Collections */
+/* The actions are libsqcart's (sq_do_*, shared with the home screen); these
+ * only run them in the worker thread and show the result */
+
+/* Copy cartridge to SD card, then refresh the Collections */
 static void* TaskDumpRom(void* arg)
 {
-	char out[SQ_PATH_LEN], line1[COLS + 1], line2[COLS + 1];
-	struct sq_error e = { "", 0 };
-	int already, verified, save_copied;
-	const char* name;
+	struct sq_result r;
+	int added;
 	(void)arg;
 
 	snprintf(work_title, sizeof(work_title), "Copying %s...", cart.rom);
 	work_total = cart.rom_size;
-	if (sq_dump_to_library(&cart, out, sizeof(out), &already, &verified, &save_copied,
-			Progress, NULL, &e) != 0) {
-		SetError("Copy failed:", &e);
-		worker_busy = 0;
-		return NULL;
-	}
-	name = strrchr(out, '/') ? strrchr(out, '/') + 1 : out;
-	snprintf(line1, sizeof(line1), "roms/%s/", cart.sysdir);
-	snprintf(line2, sizeof(line2), "%s", name);
-	if (already) {
-		SetMessage(C_OK, "This cartridge is already on the SD card:", line1, line2, NULL);
-	} else {
-		/* Make it show up under Load Content > Collections right away */
-		if (system(SCAN_CMD " > /dev/null 2>&1") != 0)
-			sq_log("%s failed", SCAN_CMD);
-		if (verified)
-			SetMessage(C_OK, "Copied to", line1, line2,
-				save_copied ? "Its save was copied too." : NULL);
-		else
-			SetMessage(C_BAD, "Copied, but the checksum doesn't match:", line2,
-				"the cartridge may be dirty or a reproduction.", NULL);
-	}
+	sq_do_copy_to_library(&cart, Progress, NULL, &added, &r);
+	/* Make it show up under Load Content > Collections right away */
+	if (added && system(SCAN_CMD " > /dev/null 2>&1") != 0)
+		sq_log("%s failed", SCAN_CMD);
+	SetResult(&r);
 	worker_busy = 0;
 	return NULL;
 }
 
-/* Back up cartridge save: saves/<game>/NNN-cartridge.sav */
 static void* TaskDumpSave(void* arg)
 {
-	char line[COLS + 1];
-	struct sq_error e = { "", 0 };
-	int existed, n;
+	struct sq_result r;
 	(void)arg;
-
 	snprintf(work_title, sizeof(work_title), "Backing up the save...");
-	n = sq_backup_cart_save(&cart, &existed, &e);
-	snprintf(line, sizeof(line), "saves/%s/ as #%d", cart.base, n);
-	if (n < 0)
-		SetError("Backup failed:", &e);
-	else if (existed)
-		SetMessage(C_OK, "This save is already backed up:", line, NULL, NULL);
-	else
-		SetMessage(C_OK, "The cartridge's save is backed up in", line, NULL, NULL);
+	sq_do_backup_save(&cart, &r);
+	SetResult(&r);
 	worker_busy = 0;
 	return NULL;
 }
 
-/* Restore: make backups[restore_sel] the save used when the cartridge is
- * played; the save being replaced is backed up first */
+static void* TaskWriteSave(void* arg)
+{
+	struct sq_result r;
+	(void)arg;
+	snprintf(work_title, sizeof(work_title), "Writing the save to the cartridge...");
+	sq_do_write_save(&cart, backups[restore_sel].path, CART_RW_CMD, &r);
+	SetResult(&r);
+	worker_busy = 0;
+	return NULL;
+}
+
 static void* TaskRestore(void* arg)
 {
-	struct sq_error e = { "", 0 };
+	struct sq_result r;
 	(void)arg;
-
 	snprintf(work_title, sizeof(work_title), "Restoring the save...");
-	if (sq_restore_save(&cart, backups[restore_sel].path, &e) != 0)
-		SetError("Restore failed:", &e);
-	else
-		SetMessage(C_OK, "Save restored.",
-			"It is used the next time you play the cartridge.",
-			"The previous save was backed up first.", NULL);
+	sq_do_restore_save(&cart, backups[restore_sel].path, &r);
+	SetResult(&r);
 	worker_busy = 0;
 	return NULL;
 }
@@ -268,6 +240,7 @@ static void StartTask(void* (*task)(void*))
 		return;
 	}
 	work_done = work_total = 0;
+	meter.total = -1;	/* a new meter once the task says its size */
 	work_title[0] = '\0';
 	worker_busy = 1;
 	screen = SCREEN_BUSY;
@@ -319,6 +292,8 @@ static int ItemEnabled(int item)
 		return cart.present && cart.save_size > 0;
 	case ITEM_RESTORE:
 		return cart.present;
+	case ITEM_WRITE_SAVE:
+		return cart.present && cart.save_size > 0;
 	default:
 		return 1;
 	}
@@ -331,6 +306,7 @@ static const char* ItemHelp(int item)
 	case ITEM_DUMP_ROM:  return "Put the game in roms/ to play without the cartridge.";
 	case ITEM_DUMP_SAVE: return "Copy the cartridge's save into saves/ on the SD card.";
 	case ITEM_RESTORE:   return "Choose which save to use with this cartridge.";
+	case ITEM_WRITE_SAVE: return "Experimental: put a save on the cartridge.";
 	default:             return "Return to RetroArch's menu.";
 	}
 }
@@ -365,6 +341,18 @@ static int DrawHeader(void)
 	return y + 2 * LINE;
 }
 
+/* Buttons in a row above the footer, the one at sel highlighted */
+static void DrawButtons(const char* const* labels, int n, int sel)
+{
+	int i, x = MARGIN, y = HEIGHT - 3 * LINE;
+	for (i = 0; i < n; i++) {
+		int w = ((int)strlen(labels[i]) + 4) * FONT_WIDTH_STRIDE;
+		FillRect(x, y - 3, w, LINE + 4, i == sel ? C_SELECT : C_DIM);
+		DrawText(x + 2 * FONT_WIDTH_STRIDE, y, labels[i], i == sel ? C_TITLE : C_TEXT);
+		x += w + 8;
+	}
+}
+
 static void DrawFooter(const char* text)
 {
 	FillRect(MARGIN, HEIGHT - MARGIN - LINE - 3, WIDTH - 2 * MARGIN, 1, C_DIM);
@@ -385,6 +373,9 @@ static void DrawList(int y, const char** labels, int count, int sel, int (*enabl
 
 static void Render(void)
 {
+	static const char* const yes_no[2] = { "No", "Yes" };
+	static const char* const no_write[2] = { "No", "Write it" };
+	static const char* const ok[1] = { "OK" };
 	int y, i;
 	const char* labels[MAX_BACKUPS + 1];
 
@@ -400,11 +391,13 @@ static void Render(void)
 		break;
 
 	case SCREEN_RESTORE:
-		DrawText(MARGIN, y, "Use which save with this cartridge?", C_TEXT);
+		DrawText(MARGIN, y, writing ? "Write which save to the cartridge?"
+			: "Use which save with this cartridge?", C_TEXT);
 		y += LINE + LINE / 2;
 		if (backup_count == 0) {
 			DrawText(MARGIN, y, "No saves found for this game:", C_DIM);
-			DrawText(MARGIN, y + LINE, "back up the cartridge's save first.", C_DIM);
+			DrawText(MARGIN, y + LINE, writing ? "play it or back up its save first."
+				: "back up the cartridge's save first.", C_DIM);
 		} else {
 			/* Scroll so the selection stays on screen (9 rows fit) */
 			int first = restore_sel > 8 ? restore_sel - 8 : 0;
@@ -417,23 +410,51 @@ static void Render(void)
 		break;
 
 	case SCREEN_CONFIRM:
+		if (writing) {
+			DrawText(MARGIN, y, confirm_step == 0 ? "Write this save onto the CARTRIDGE?"
+				: "Sure? This changes the cartridge itself.", confirm_step ? C_BAD : C_TEXT);
+			y += LINE + LINE / 2;
+			DrawText(MARGIN + 8, y, backups[restore_sel].label, C_TITLE);
+			y += 2 * LINE;
+			DrawText(MARGIN, y, "The cartridge's save is backed up to the", C_DIM);
+			y += LINE;
+			DrawText(MARGIN, y, "SD card first. Experimental: not every", C_DIM);
+			y += LINE;
+			DrawText(MARGIN, y, "cartridge slot can write. Don't remove", C_DIM);
+			y += LINE;
+			DrawText(MARGIN, y, "the cartridge until it's done.", C_DIM);
+			DrawButtons(confirm_step == 0 ? yes_no : no_write, 2, confirm_button);
+			DrawFooter("Left/Right: choose   A: press   B: no");
+			break;
+		}
 		DrawText(MARGIN, y, "Use this save when playing the cartridge?", C_TEXT);
 		y += LINE + LINE / 2;
 		DrawText(MARGIN + 8, y, backups[restore_sel].label, C_TITLE);
 		y += 2 * LINE;
 		DrawText(MARGIN, y, "Your current save is backed up first.", C_DIM);
 		y += LINE;
-		DrawText(MARGIN, y, "The cartridge itself is never changed.", C_DIM);
-		DrawFooter("A: yes     B: no");
+		DrawText(MARGIN, y, "The cartridge itself isn't changed.", C_DIM);
+		DrawButtons(yes_no, 2, confirm_button);
+		DrawFooter("Left/Right: choose   A: press   B: no");
 		break;
 
 	case SCREEN_BUSY:
 		DrawText(MARGIN, y, work_title, C_TEXT);
 		y += 2 * LINE;
 		if (work_total > 0) {
+			/* A copy: bar, "MB of MB", speed and time left, the same
+			 * words as the loading screen and the home screen */
+			char size[COLS + 1], rate[COLS + 1];
 			int w = WIDTH - 2 * MARGIN;
+			if (meter.total != work_total)
+				sq_meter_start(&meter, work_total);
 			FillRect(MARGIN, y, w, LINE, C_DIM);
 			FillRect(MARGIN, y, (int)((double)w * work_done / work_total), LINE, C_TITLE);
+			sq_meter_text(&meter, work_done, NowMs(), 0, size, sizeof(size), rate, sizeof(rate));
+			y += LINE + LINE / 2;
+			DrawText(MARGIN, y, size, C_TEXT);
+			y += LINE;
+			DrawText(MARGIN, y, rate, C_TEXT);
 		} else {
 			/* No size known: a dot moving back and forth */
 			int pos = (frame_count / 4) % 20;
@@ -448,7 +469,8 @@ static void Render(void)
 		DrawText(MARGIN, y, msg[0], msg_color);
 		for (i = 1; i < 4; i++)
 			DrawText(MARGIN, y + i * LINE + LINE / 2, msg[i], C_TEXT);
-		DrawFooter("A or B: continue");
+		DrawButtons(ok, 1, 0);
+		DrawFooter("A: OK");
 		break;
 	}
 }
@@ -505,6 +527,8 @@ static void HandleInput(unsigned pressed)
 			StartTask(TaskDumpSave);
 			break;
 		case ITEM_RESTORE:
+		case ITEM_WRITE_SAVE:
+			writing = main_sel == ITEM_WRITE_SAVE;
 			ListBackups();
 			screen = SCREEN_RESTORE;
 			break;
@@ -521,15 +545,24 @@ static void HandleInput(unsigned pressed)
 			restore_sel--;
 		else if (PRESSED(DOWN) && restore_sel < backup_count - 1)
 			restore_sel++;
-		else if (PRESSED(A))
+		else if (PRESSED(A)) {
+			confirm_step = 0;
+			confirm_button = 0;
 			screen = SCREEN_CONFIRM;
+		}
 		break;
 
 	case SCREEN_CONFIRM:
-		if (PRESSED(A))
-			StartTask(TaskRestore);
-		else if (PRESSED(B))
+		/* No and Yes buttons: Left/Right pick, A presses, B is No */
+		if (PRESSED(LEFT) || PRESSED(RIGHT) || PRESSED(UP) || PRESSED(DOWN))
+			confirm_button = !confirm_button;
+		else if (PRESSED(B) || (PRESSED(A) && confirm_button == 0))
 			screen = SCREEN_RESTORE;
+		else if (PRESSED(A) && writing && confirm_step == 0) {
+			confirm_step = 1;	/* writing to a cartridge: ask again */
+			confirm_button = 0;
+		} else if (PRESSED(A))
+			StartTask(writing ? TaskWriteSave : TaskRestore);
 		break;
 
 	case SCREEN_BUSY:

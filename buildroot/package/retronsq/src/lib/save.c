@@ -3,7 +3,8 @@
  * and checking a save for problems (see sqcart.h).
  *
  * Rules:
- *   - The cartridge is never written. Its save is copied to the cache as
+ *   - The cartridge is never written here (only cartwrite.c does, when the
+ *     user asks for it). Its save is copied to the cache as
  *     <name>.srm the first time (sq_import_save); from then on that .srm is
  *     the live save RetroArch reads and writes.
  *   - Backups live in SQ_SAVES_DIR/<name>/NNN-<kind>.sav, numbered upward;

@@ -5,9 +5,12 @@
 #
 # Every pass of the loop below picks what should run and runs it in the
 # foreground until RetroArch exits:
-#   - a cartridge is inserted and CART_AUTOLOAD=1, or Cartridge Tools asked
-#     for it ("Play cartridge")  -> copy it if needed, then play it
-#   - otherwise                  -> the RetroArch menu (games on the SD card)
+#   - a cartridge was just inserted and CART_AUTOLOAD=1, or the home screen
+#     or Cartridge Tools asked for it ("Play cartridge")
+#                                -> copy it if needed, then play it
+#   - otherwise                  -> the home screen (sqhome), which hands
+#                                   back what to play; or with UI=retroarch
+#                                   the RetroArch menu
 #
 # Nothing else ever starts RetroArch. cart-event (cartridge in/out), the
 # reset button and HDMI hotplug only stop it (KillGame), and this loop then
@@ -18,9 +21,13 @@
 . "${SQ_LIB:-${SQ_ROOT:-}/usr/lib/retronsq}/common.sh"
 
 echo $$ > "$SESSION_PID"
+LogSD "boot: session started"
 SyncUserdata
 # A cartridge inserted at power-on must start before the menu ever shows
 WaitForReader
+# The splash stays until the first program (loading screen, game or home
+# screen) is up; then it's cleared, so it doesn't show between programs
+( sleep 4; BlankFramebuffer ) &
 
 CART_FAILS=0    # failed loads of the inserted cartridge in a row
 QUICK_EXITS=0   # RetroArch exits within 3 seconds in a row
@@ -32,9 +39,11 @@ while true; do
 		continue
 	fi
 
+	# Auto-load starts a cartridge once per insert: leaving its game goes
+	# to the home screen (or menu), not into the game again
 	WANT_CART=0
 	if CartPresent && [ ! -f "$CART_FAILED" ]; then
-		[ "$(CfgGet CART_AUTOLOAD)" = 1 ] && WANT_CART=1
+		[ "$(CfgGet CART_AUTOLOAD)" = 1 ] && [ ! -f "$CART_PLAYED" ] && WANT_CART=1
 		[ -f "$PLAY_FLAG" ] && WANT_CART=1
 	fi
 	rm -f "$PLAY_FLAG"
@@ -60,10 +69,15 @@ while true; do
 		START=$(date +%s)
 		LaunchCart
 	elif [ "$(CfgGet NO_CART)" = menu ]; then
-		# No cartridge (or auto-load off): RetroArch menu for SD card games
+		# Otherwise the home screen (or RetroArch's menu, UI=retroarch)
 		CART_FAILS=0
 		START=$(date +%s)
-		LaunchMenu
+		HOME_ACTED=0
+		if [ "$(CfgGet UI)" = retroarch ]; then
+			LaunchMenu
+		else
+			LaunchHome
+		fi
 	else
 		# NO_CART=none: blank screen like the stock firmware, just wait
 		CART_FAILS=0
@@ -74,7 +88,11 @@ while true; do
 
 	# RetroArch exited (quit, reset, cartridge change...). Back off if it
 	# keeps dying straight away (bad core, no GPU...) instead of spinning.
-	if [ $(($(date +%s) - START)) -lt 3 ]; then
+	# The home screen handing something over is it working, not dying.
+	if [ "$HOME_ACTED" = 1 ]; then
+		QUICK_EXITS=0
+		HOME_ACTED=0
+	elif [ $(($(date +%s) - START)) -lt 3 ]; then
 		QUICK_EXITS=$((QUICK_EXITS + 1))
 		[ $QUICK_EXITS -ge 3 ] && sleep 5
 	else

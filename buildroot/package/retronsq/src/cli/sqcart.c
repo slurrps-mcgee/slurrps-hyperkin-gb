@@ -13,6 +13,12 @@
  *   sqcart rom-header FILE       TITLE= and CODE= of a ROM file
  *   sqcart crc FILE              the reader's CRC of a file (decimal), as
  *                                stored big-endian in the cartridge's .crc
+ *   sqcart history-add PATH LABEL   put a game at the top of the home
+ *                                screen's "Recently played"
+ *   sqcart write-check           a save was written to this cartridge
+ *                                earlier: is it really on it? Prints OK=1|0
+ *                                and the lines to show; exit 1 when there
+ *                                was nothing to check
  *
  * See sqcart.h for what each one does underneath.
  */
@@ -27,7 +33,8 @@ static void usage(void)
 	fprintf(stderr,
 		"usage: sqcart info | reader-state | cache-valid [--verify] | cache |\n"
 		"              import-save | backup-save | check-save FILE [CODE] |\n"
-		"              rom-header FILE | crc FILE\n");
+		"              rom-header FILE | crc FILE | history-add PATH LABEL |\n"
+		"              write-check\n");
 }
 
 /* Print a value for the shell, without characters that would break KEY=value */
@@ -189,6 +196,21 @@ int main(int argc, char** argv)
 		print_kv("CODE", code);
 		return 0;
 	}
+	if (!strcmp(cmd, "write-check")) {
+		struct sq_cart c;
+		struct sq_result r;
+		int i;
+		sq_cart_scan(&c);
+		if (!sq_write_check(&c, &r))
+			return 1;
+		printf("OK=%d\n", r.ok);
+		for (i = 0; i < 4; i++)
+			if (r.line[i][0])
+				printf("%s\n", r.line[i]);
+		return 0;
+	}
+	if (!strcmp(cmd, "history-add") && argc > 3)
+		return sq_history_add(argv[2], argv[3]) == 0 ? 0 : 1;
 	if (!strcmp(cmd, "crc") && argc > 2) {
 		struct sq_error e;
 		uint32_t crc;

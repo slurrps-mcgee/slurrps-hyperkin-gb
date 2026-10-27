@@ -13,6 +13,7 @@
 #   - While $SQ_ROOT/ra-stuck exists it is stuck (ignores SIGTERM), like a
 #     crashed core, until SIGKILL.
 echo "$*" >> "$SQ_ROOT/ra-calls"
+echo "close=${RETRONSQ_CLOSE_QUITS:-}" >> "$SQ_ROOT/ra-env"
 echo $$ > "$SQ_ROOT/fake-ra.pid"
 
 # Effective stdin_cmd_enable: the config, then the appended one

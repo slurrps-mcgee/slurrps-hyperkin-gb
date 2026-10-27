@@ -9,9 +9,12 @@
  *   <name>.sav                the cartridge's save memory, if any
  *   <name>.crc                4-byte CRC of the ROM (big endian, see crc.c)
  *
- * The firmware never writes to the cartridge. It copies the ROM to
- * SQ_ROM_DIR (the "cache"), keeps the live save there as <name>.srm, and
- * backs up cartridge saves in SQ_SAVES_DIR/<name>/NNN-<kind>.sav.
+ * The firmware doesn't play from the cartridge or save to it. It copies the
+ * ROM to SQ_ROM_DIR (the "cache"), keeps the live save there as
+ * <name>.srm, and backs up cartridge saves in
+ * SQ_SAVES_DIR/<name>/NNN-<kind>.sav. The one exception is Cartridge
+ * Tools' "Write a save to the cartridge", asked for explicitly
+ * (sq_write_cart_save).
  *
  * All paths go through sq_path(), which prefixes $SQ_ROOT when it is set, so
  * tests can run against a sandbox. Functions report failures in a struct
@@ -53,6 +56,28 @@ void sq_fail(struct sq_error* e, int err, const char* fmt, ...);
 
 /* Log a line to stderr (and the console log, through the caller) */
 void sq_log(const char* fmt, ...);
+/* Also log a line to logs/launcher.log on the SD card, synced at once
+ * (like LogSD in common.sh) */
+void sq_log_sd(const char* fmt, ...);
+
+/* --- copy progress as the screens show it ------------------------------ */
+
+/*
+ * One meter per copy, shared by the loading screen, the home screen and
+ * Cartridge Tools so they all say the same: "8.0 of 16.0 MB" and
+ * "1.0 MB/s, about 8 s left". The speed is the average since the first
+ * data, shown once 1.5 s of it has arrived (before that it jumps around).
+ */
+struct sq_meter {
+	long total;
+	unsigned long first_ms;	/* when data first came (0: not yet) */
+	long first_bytes;
+};
+void sq_meter_start(struct sq_meter* m, long total);
+/* size: "8.0 of 16.0 MB"; rate: "1.0 MB/s, about 8 s left", "Measuring
+ * speed..." or "Done". ASCII only (the tools core's font has nothing else). */
+void sq_meter_text(struct sq_meter* m, long done, unsigned long now_ms, int finished,
+	char* size, size_t size_len, char* rate, size_t rate_len);
 
 /* --- small file helpers ------------------------------------------------- */
 
@@ -184,6 +209,45 @@ int sq_backup_list(const char* game, struct sq_backup* out, int max);
  * current one first. Returns 0 on success. */
 int sq_restore_save(const struct sq_cart* c, const char* path, struct sq_error* e);
 
+/* --- writing a save to the cartridge ------------------------------------- */
+
+/*
+ * Only for Cartridge Tools' "Write a save to the cartridge", which the user
+ * asks for and confirms. The cartridge is mounted read-only; the caller
+ * opens it for writing (cart-event write-enable) just before and closes it
+ * again (write-disable) right after, and backs up the cartridge's save
+ * first.
+ */
+
+/* Whether the reader accepts writes, as its drive reported when it was
+ * mounted (cart-event records it): 1 yes, 0 write-protected, -1 unknown */
+int sq_reader_writable(void);
+
+/*
+ * Write data over the cartridge's save file, in place: same size, no
+ * truncation, no new file, so the drive's FAT and directory don't change
+ * (the reader maps the file's sectors to the save chip). Then read it back
+ * past the page cache and compare. Refuses a save of another size than the
+ * cartridge's. Returns 0 when written and read back identical.
+ */
+int sq_write_cart_save(const struct sq_cart* c, const void* data, long size,
+	struct sq_error* e);
+
+/*
+ * Did it really reach the cartridge? A slot can take a write, and even read
+ * it back, without storing it on the cartridge (keeping it in its own
+ * memory, say). The only proof is the cartridge being taken out and put
+ * back. So after a write, what was written is remembered
+ * (sq_write_check_remember, in SQ_HOME_DIR, so a power-off in between is
+ * fine), and the next time that cartridge is inserted sq_write_check
+ * compares its save and fills r with the verdict. Returns 1 when it checked
+ * (the record is then dropped), 0 when nothing was pending for this
+ * cartridge.
+ */
+struct sq_result;	/* see "cartridge actions" below */
+void sq_write_check_remember(const struct sq_cart* c, const void* data, long size);
+int sq_write_check(const struct sq_cart* c, struct sq_result* r);
+
 /* --- save checks -------------------------------------------------------- */
 
 /* Expected save sizes, and whether size is one a cartridge can have */
@@ -208,6 +272,100 @@ struct sq_gen3_report {
 };
 /* Check a Gen 3 Pokémon save the way the game does */
 void sq_gen3_check(const uint8_t* data, long size, struct sq_gen3_report* r);
+
+/* --- settings (retronsq.cfg) ------------------------------------------- */
+
+#define SQ_CFG_FILE	"/userdata/retronsq.cfg"		/* the user's settings */
+#define SQ_DEFAULTS_FILE "/usr/share/retronsq/defaults.cfg"	/* every default */
+
+/*
+ * A setting's value, read like the scripts' CfgGet: KEY=value lines, spaces
+ * around "=", quotes and Windows line endings are fine, the last line for
+ * a key wins, and a missing or empty value falls back to defaults.cfg.
+ * Writes "" when there is neither. Returns out.
+ */
+char* sq_cfg_get(const char* key, char* out, size_t len);
+/* Set a setting: its first line is replaced (later duplicates removed), or
+ * a line is added; the rest of the file, comments included, is kept.
+ * Written atomically. Returns 0 on success. */
+int sq_cfg_set(const char* key, const char* value, struct sq_error* e);
+
+/* --- the game library (home screen) -------------------------------------- */
+
+#define SQ_HOME_DIR	"/userdata/home"	/* history.txt, favorites.txt */
+#define SQ_THUMBS_DIR	"/userdata/retroarch/thumbnails"	/* RetroArch's */
+#define SQ_HISTORY_MAX	30
+
+struct sq_game {
+	char path[SQ_PATH_LEN];	/* on the console (no $SQ_ROOT): /userdata/... */
+	char label[128];	/* what is shown: the file name without extension */
+	char system[4];		/* "gba", "gbc" or "gb" */
+};
+
+/* The system a ROM file is for, from its extension (any case); a .zip goes
+ * by the gba/gbc/gb folder it is in. "gba", "gbc" or "gb". */
+const char* sq_rom_system(const char* path);
+/* RetroArch's playlist name for a system ("Nintendo - Game Boy Advance") */
+const char* sq_system_name(const char* system);
+/* Games under dir (e.g. SQ_ROMS_DIR, recursively; hidden files skipped),
+ * for one system or all (system NULL), sorted by label ignoring case.
+ * *out is malloc'ed (free it); returns how many, or -1. */
+int sq_library_scan(const char* dir, const char* system, struct sq_game** out);
+/* Recently played (newest first) and favorites, from SQ_HOME_DIR. Entries
+ * whose file is gone are left out. Same return as sq_library_scan. */
+int sq_history_load(struct sq_game** out);
+int sq_favorites_load(struct sq_game** out);
+/* Put a game at the top of the history (at most SQ_HISTORY_MAX kept) */
+int sq_history_add(const char* path, const char* label);
+/* Add or remove a favorite; returns 1 when it is a favorite afterwards,
+ * 0 when not, -1 on error */
+int sq_favorite_toggle(const char* path, const char* label);
+int sq_is_favorite(const char* path);
+/* A game's box art (full path, with $SQ_ROOT): a PNG next to the game with
+ * its name (roms/gba/Golden Sun.png) when there is one, else RetroArch's:
+ * SQ_THUMBS_DIR/<system name>/Named_Boxarts/<label>.png, with &*\/:`<>?|
+ * in the label replaced by _ */
+char* sq_boxart_path(const struct sq_game* g, char* out, size_t len);
+
+/* --- cartridge actions (Cartridge Tools and the home screen) ------------- */
+
+/* What an action did, for the screen: a few short lines (the first one is
+ * the headline) and whether it worked */
+#define SQ_RESULT_COLS 50
+struct sq_result {
+	int ok;
+	char line[4][SQ_RESULT_COLS + 1];
+};
+
+/* A save that can be restored or written to the cartridge */
+struct sq_save_choice {
+	char label[64];
+	char path[SQ_PATH_LEN];
+};
+/*
+ * The saves to offer, newest first: for restoring, the save on the
+ * cartridge now, then the backups; for writing to the cartridge, the save
+ * played with now (the live save), then the backups. Returns how many.
+ */
+int sq_save_choices(const struct sq_cart* c, int for_writing,
+	struct sq_save_choice* out, int max);
+
+/* Copy cartridge to SD card (roms/<system>/, with its save). *added tells
+ * whether a new game landed in the library (playlists need a refresh). */
+void sq_do_copy_to_library(const struct sq_cart* c, sq_progress_fn progress,
+	void* ctx, int* added, struct sq_result* r);
+/* Back up the cartridge's save into saves/<game>/ */
+void sq_do_backup_save(const struct sq_cart* c, struct sq_result* r);
+/* Make the save at path the one played with (the current one is backed up) */
+void sq_do_restore_save(const struct sq_cart* c, const char* path, struct sq_result* r);
+/*
+ * Experimental: write the save at path onto the cartridge. Checks first
+ * (reader write protection, size, Gen 3 sanity), backs up the cartridge's
+ * save, then runs "<rw_cmd> write-enable", sq_write_cart_save and
+ * "<rw_cmd> write-disable". Every step is logged with sq_log_sd.
+ */
+void sq_do_write_save(const struct sq_cart* c, const char* path, const char* rw_cmd,
+	struct sq_result* r);
 
 #ifdef __cplusplus
 }

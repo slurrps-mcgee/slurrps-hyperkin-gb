@@ -15,6 +15,7 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdlib.h>
 #include <compat/strl.h>
 #include <file/file_path.h>
 #include <retro_assert.h>
@@ -3510,6 +3511,12 @@ static int action_ok_option_create(const char *path,
 
 int action_ok_close_content(const char *path, const char *label, unsigned type, size_t idx, size_t entry_idx)
 {
+   /* Retron SQ CFW: launched from the home screen, closing the game goes
+    * back to it, i.e. RetroArch quits (normally: the game is saved) */
+   const char *close_quits = getenv("RETRONSQ_CLOSE_QUITS");
+   if (close_quits && close_quits[0] == '1')
+      return generic_action_ok_command(CMD_EVENT_QUIT);
+
    /* This line resets the navigation pointer so the active entry will be "Run" */
    menu_navigation_set_selection(0);
    return generic_action_ok_command(CMD_EVENT_UNLOAD_CORE);

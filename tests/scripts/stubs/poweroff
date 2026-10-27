@@ -1,0 +1,3 @@
+#!/bin/sh
+# Test stub: records that the console would power off
+echo "poweroff" >> "$SQ_ROOT/calls.log"

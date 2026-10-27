@@ -173,31 +173,6 @@ static void test_dump_to_library(void)
 
 /* --- Gen 3 save checker ------------------------------------------------- */
 
-static void le32w(uint8_t* p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
-
-/* Write a valid slot: 14 sectors, rotated like the game does */
-static void make_slot(uint8_t* save, int slot, uint32_t counter, unsigned seed)
-{
-	int i;
-	srand(seed);
-	for (i = 0; i < 14; i++) {
-		uint8_t* sec = save + (slot * 14 + i) * 0x1000;
-		int id = (i + counter) % 14, j;
-		uint32_t sum = 0;
-		int size = id == 0 ? 3884 : id == 4 ? 3848 : id == 13 ? 2000 : 3968;
-		memset(sec, 0, 0x1000);
-		for (j = 0; j < size; j++)
-			sec[j] = rand() & 0xFF;
-		for (j = 0; j < 3968; j += 4)
-			sum += sec[j] | sec[j + 1] << 8 | sec[j + 2] << 16 | (uint32_t)sec[j + 3] << 24;
-		sec[0xFF4] = id;
-		sec[0xFF6] = (uint16_t)((sum >> 16) + sum) & 0xFF;
-		sec[0xFF7] = (uint16_t)((sum >> 16) + sum) >> 8;
-		le32w(sec + 0xFF8, 0x08012025u);
-		le32w(sec + 0xFFC, counter);
-	}
-}
-
 static void test_gen3(void)
 {
 	uint8_t* save = calloc(1, 131072);
@@ -217,6 +192,203 @@ static void test_gen3(void)
 	sq_gen3_check(save, 65536, &r);		/* reader read one bank only */
 	CHECK(r.truncated && r.slot[0].valid && !r.slot[1].valid && r.newest == 0);
 	free(save);
+}
+
+/* Writing a save to the cartridge (Cartridge Tools, experimental) */
+static void test_cart_write(void)
+{
+	struct sq_cart c;
+	struct sq_error e;
+	unsigned char* data = random_data(131072, 42);
+	unsigned char* other = random_data(65536, 43);
+	char p[SQ_PATH_LEN];
+
+	clean();
+	CHECK(sq_reader_writable() == -1);		/* not recorded: unknown */
+	put_text("/run/retronsq/reader-wp", "1\n");
+	CHECK(sq_reader_writable() == 0);
+	put_text("/run/retronsq/reader-wp", "0\n");
+	CHECK(sq_reader_writable() == 1);
+
+	insert_cart("Game.gba", 1024 * 1024, 131072, 7, 1, 1);
+	sq_cart_scan(&c);
+	path(p, "/media/cart/Game.sav");
+
+	/* Another size: refused, the cartridge's save untouched */
+	CHECK(sq_write_cart_save(&c, other, 65536, &e) != 0 && strstr(e.msg, "65536"));
+	CHECK(size_of("/media/cart/Game.sav") == 131072 && !sq_same_content(p, data, 131072));
+
+	/* Same size: written in place and read back */
+	CHECK(sq_write_cart_save(&c, data, 131072, &e) == 0);
+	CHECK(sq_same_content(p, data, 131072));
+	CHECK(!exists("/media/cart/Game.sav.tmp") && !exists("/media/cart/Game.sav.part"));
+
+	/* A read-only cartridge file (not opened for writing): a clear error */
+	chmod(p, 0444);
+	CHECK(sq_write_cart_save(&c, data, 131072, &e) != 0 && strstr(e.msg, "opening"));
+	chmod(p, 0644);
+
+	/* Swapped since the scan: refused */
+	put_text("/run/retronsq/cart-generation", "9\n");
+	CHECK(sq_write_cart_save(&c, data, 131072, &e) != 0 && strstr(e.msg, "removed or changed"));
+
+	/* No save on the cartridge: refused */
+	remove_cart();
+	insert_cart("NoSave.gba", 1024 * 1024, 0, 8, 1, 10);
+	sq_cart_scan(&c);
+	CHECK(sq_write_cart_save(&c, data, 131072, &e) != 0 && strstr(e.msg, "no save"));
+
+	/* Did it stick? Checked when the cartridge is next inserted: here a
+	 * cartridge that came back holding what was written */
+	{
+		struct sq_result r;
+		remove_cart();
+		insert_cart("Game.gba", 1024 * 1024, 131072, 7, 1, 12);
+		put("/media/cart/Game.sav", data, 131072);
+		sq_cart_scan(&c);
+		CHECK(sq_write_check(&c, &r) == 0);		/* nothing remembered */
+		sq_write_check_remember(&c, data, 131072);
+		/* The slot kept it: the cartridge comes back with the new save */
+		CHECK(sq_write_check(&c, &r) == 1 && r.ok && strstr(r.line[0], "is on the cartridge"));
+		CHECK(!exists("/userdata/home/cart-write-check"));	/* checked once */
+		/* The slot didn't: the old save comes back */
+		sq_write_check_remember(&c, other, 65536);
+		CHECK(sq_write_check(&c, &r) == 1 && !r.ok && strstr(r.line[0], "still has its old save"));
+		/* Another cartridge: not its check */
+		sq_write_check_remember(&c, data, 131072);
+		remove_cart();
+		insert_cart("Other.gba", 1024 * 1024, 131072, 9, 1, 11);
+		sq_cart_scan(&c);
+		CHECK(sq_write_check(&c, &r) == 0 && exists("/userdata/home/cart-write-check"));
+	}
+
+	/* sq_log_sd keeps a line on the SD card */
+	sq_log_sd("test line %d", 7);
+	{
+		char* log = read_text("/userdata/logs/launcher.log");
+		CHECK(log && strstr(log, "] test line 7\n"));
+		free(log);
+	}
+	free(data);
+	free(other);
+}
+
+/* Settings: tolerant reading like CfgGet, writing that keeps the file */
+static void test_config(void)
+{
+	char v[64];
+	char* text;
+	struct sq_error e;
+
+	clean();
+	put_text("/usr/share/retronsq/defaults.cfg", "# defaults\nGBA_CORE=gpsp\nCART_WAIT=25\n");
+	CHECK(!strcmp(sq_cfg_get("GBA_CORE", v, sizeof(v)), "gpsp"));	/* no file */
+	put_text("/userdata/retronsq.cfg",
+		"# my settings\r\nGBA_CORE = \"mgba\"\r\nCART_WAIT=\nGBA_CORE_X=1\nGBA_CORE=vbam\n");
+	CHECK(!strcmp(sq_cfg_get("GBA_CORE", v, sizeof(v)), "vbam"));	/* last wins */
+	CHECK(!strcmp(sq_cfg_get("CART_WAIT", v, sizeof(v)), "25"));	/* empty: default */
+	CHECK(!strcmp(sq_cfg_get("NOPE", v, sizeof(v)), ""));
+
+	CHECK(sq_cfg_set("GBA_CORE", "gpsp", &e) == 0);
+	CHECK(sq_cfg_set("CART_AUTOLOAD", "0", &e) == 0);
+	text = read_text("/userdata/retronsq.cfg");
+	CHECK(text && strstr(text, "# my settings\r\n") && strstr(text, "GBA_CORE=gpsp\n"));
+	CHECK(text && !strstr(text, "vbam") && !strstr(text, "mgba"));	/* duplicates gone */
+	CHECK(text && strstr(text, "GBA_CORE_X=1") && strstr(text, "CART_AUTOLOAD=0\n"));
+	free(text);
+	CHECK(!strcmp(sq_cfg_get("GBA_CORE", v, sizeof(v)), "gpsp"));
+	CHECK(sq_cfg_set("GBA_CORE", "x;reboot", &e) != 0);		/* values stay plain */
+	CHECK(sq_cfg_set("A=B", "1", &e) != 0);
+}
+
+/* The game library: scanning, history, favorites, box art */
+static void test_library(void)
+{
+	struct sq_game* g = NULL;
+	char p[SQ_PATH_LEN];
+	int n;
+
+	clean();
+	put("/userdata/roms/gba/Zelda.gba", "x", 1);
+	put("/userdata/roms/gba/sub/advance wars.GBA", "x", 1);
+	put("/userdata/roms/gba/Pack.zip", "x", 1);
+	put("/userdata/roms/gb/Tetris.gb", "x", 1);
+	put("/userdata/roms/gbc/Link.gbc", "x", 1);
+	put("/userdata/roms/gba/._Zelda.gba", "x", 1);	/* macOS junk */
+	put("/userdata/roms/gba/notes.txt", "x", 1);
+
+	n = sq_library_scan(SQ_ROMS_DIR, "gba", &g);
+	CHECK(n == 3);
+	CHECK(n == 3 && !strcmp(g[0].label, "advance wars") && !strcmp(g[1].label, "Pack")
+		&& !strcmp(g[2].label, "Zelda"));
+	CHECK(n == 3 && !strcmp(g[2].path, "/userdata/roms/gba/Zelda.gba"));	/* no $SQ_ROOT */
+	CHECK(n == 3 && !strcmp(g[1].system, "gba"));				/* zip by folder */
+	free(g);
+	n = sq_library_scan(SQ_ROMS_DIR, NULL, &g);
+	CHECK(n == 5);
+	free(g);
+	CHECK(!strcmp(sq_rom_system("/userdata/roms/gbc/x.zip"), "gbc"));
+
+	CHECK(sq_history_add("/userdata/roms/gb/Tetris.gb", "Tetris") == 0);
+	CHECK(sq_history_add("/userdata/roms/gba/Zelda.gba", "Zelda") == 0);
+	CHECK(sq_history_add("/userdata/roms/gb/Tetris.gb", "Tetris") == 0);
+	n = sq_history_load(&g);
+	CHECK(n == 2 && !strcmp(g[0].label, "Tetris") && !strcmp(g[1].label, "Zelda"));
+	free(g);
+	put("/userdata/roms/gba/Zelda.gba", "", 0);
+	path(p, "/userdata/roms/gba/Zelda.gba");
+	unlink(p);					/* deleted on a PC */
+	n = sq_history_load(&g);
+	CHECK(n == 1);
+	free(g);
+
+	CHECK(sq_favorite_toggle("/userdata/roms/gb/Tetris.gb", "Tetris") == 1);
+	CHECK(sq_is_favorite("/userdata/roms/gb/Tetris.gb"));
+	CHECK(sq_favorite_toggle("/userdata/roms/gbc/Link.gbc", "Link") == 1);
+	n = sq_favorites_load(&g);
+	CHECK(n == 2 && !strcmp(g[0].label, "Link"));
+	free(g);
+	CHECK(sq_favorite_toggle("/userdata/roms/gb/Tetris.gb", "Tetris") == 0);
+	CHECK(!sq_is_favorite("/userdata/roms/gb/Tetris.gb"));
+
+	{
+		struct sq_game z;
+		snprintf(z.label, sizeof(z.label), "Mario & Luigi: Superstar?");
+		snprintf(z.system, sizeof(z.system), "gba");
+		sq_boxart_path(&z, p, sizeof(p));
+		CHECK(strstr(p, "/userdata/retroarch/thumbnails/Nintendo - Game Boy Advance/"
+			"Named_Boxarts/Mario _ Luigi_ Superstar_.png") != NULL);
+
+		/* A picture next to the game, with its name, comes first */
+		snprintf(z.path, sizeof(z.path), "/userdata/roms/gba/Mario & Luigi.gba");
+		put("/userdata/roms/gba/Mario & Luigi.png", "png", 3);
+		sq_boxart_path(&z, p, sizeof(p));
+		CHECK(strstr(p, "/userdata/roms/gba/Mario & Luigi.png") != NULL);
+	}
+}
+
+/* The copy meter the three screens share */
+static void test_meter(void)
+{
+	struct sq_meter m;
+	char size[64], rate[64];
+	const long MB = 1048576;
+
+	sq_meter_start(&m, 16 * MB);
+	sq_meter_text(&m, 0, 1000, 0, size, sizeof(size), rate, sizeof(rate));
+	CHECK(!strcmp(size, "0.0 of 16.0 MB") && !strcmp(rate, "Measuring speed..."));
+	sq_meter_text(&m, 1 * MB, 1000, 0, size, sizeof(size), rate, sizeof(rate));
+	sq_meter_text(&m, 2 * MB, 2000, 0, size, sizeof(size), rate, sizeof(rate));
+	CHECK(!strcmp(rate, "Measuring speed..."));		/* under 1.5 s of data */
+	sq_meter_text(&m, 3 * MB, 3000, 0, size, sizeof(size), rate, sizeof(rate));
+	CHECK(!strcmp(size, "3.0 of 16.0 MB") && !strcmp(rate, "1.0 MB/s, about 13 s left"));
+	sq_meter_text(&m, 16 * MB, 16000, 1, size, sizeof(size), rate, sizeof(rate));
+	CHECK(!strcmp(rate, "Done"));
+
+	sq_meter_start(&m, 32 * MB);			/* a slow cartridge */
+	sq_meter_text(&m, 1, 10, 0, size, sizeof(size), rate, sizeof(rate));
+	sq_meter_text(&m, 1 + 1024 * 400, 2010, 0, size, sizeof(size), rate, sizeof(rate));
+	CHECK(!strncmp(rate, "200 KB/s, about 2 min ", 22));
 }
 
 static void test_atomic_write(void)
@@ -242,6 +414,10 @@ int main(void)
 	test_dump_to_library();
 	test_gen3();
 	test_atomic_write();
+	test_cart_write();
+	test_config();
+	test_library();
+	test_meter();
 
 	printf("libsqcart: %d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;
